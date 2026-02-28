@@ -1,0 +1,15 @@
+# local package
+-e .
+
+# external requirements
+numpy==2.2.6
+pandas==2.3.3
+datasets==2.21.0 #4.5.0 downgrade from 4.5.0 to 2.21.0 to avoid compatibility issues with other packages
+sentence-transformers==5.2.3
+faiss-cpu==1.13.2
+nltk==3.9.3
+rank-bm25==0.2.2
+ollama==0.6.1
+fastapi==0.133.0
+uvicorn[standard]==0.41.0
+python-dotenv>=0.5.1
