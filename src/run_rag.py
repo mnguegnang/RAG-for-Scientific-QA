@@ -40,7 +40,7 @@ class ScientificRAGPipeline:
         
         logging.info("System Ready.")
 
-    def ask(self, query: str) -> str:
+    def ask(self, query: str) -> dict:
         """
         Executes the full RAG pipeline for a given query.
         """
@@ -51,7 +51,7 @@ class ScientificRAGPipeline:
         broad_results = self.retriever.search(query, k=50)
         
         if not broad_results:
-            return "Error: No documents found in the database."
+            return {"answer": "Error: No documents found in the database.", "retrieved_docs": []}
 
         # 2. RERANK (Precision)
         logging.info("Stage 2: Reranking candidates using Cross-Encoder...")
@@ -64,14 +64,15 @@ class ScientificRAGPipeline:
         # so we just let it execute.
         final_answer = self.generator.generate_answer(query, top_5_docs)
         
-        return final_answer
+        return {"answer": final_answer,
+                "retrieved_docs": top_5_docs}
 
 def main():
     # Setup Argument Parser for Command Line Execution
     parser = argparse.ArgumentParser(description="Query the Scientific NLP RAG System.")
     parser.add_argument("--query", type=str, required=True, help="The scientific question to ask.")
     
-    # Exact requested file paths set as CLI defaults
+    # Exact requested file paths set as Command Line Interface (CLI) defaults
     parser.add_argument("--dense-index", type=str, default="data/indices/dense.index")
     parser.add_argument("--dense-meta", type=str, default="data/indices/dense.index.meta")
     parser.add_argument("--sparse-index", type=str, default="data/indices/sparse.pkl")
