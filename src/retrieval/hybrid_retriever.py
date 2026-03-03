@@ -1,8 +1,11 @@
 import faiss
 import pickle
 import numpy as np
+import torch
 from sentence_transformers import SentenceTransformer
 from collections import defaultdict
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class HybridRetriever:
     def __init__(self, 
@@ -13,7 +16,7 @@ class HybridRetriever:
         
         # 1. Load Embedding Model (for query encoding)
         print("Loading Embedding Model...")
-        self.encoder = SentenceTransformer(embedding_model_name)
+        self.encoder = SentenceTransformer(embedding_model_name, device=device)
         
         # 2. Load Dense Index (FAISS)
         print(f"Loading FAISS Index from {dense_index_path}...")

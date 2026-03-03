@@ -1,4 +1,7 @@
+import torch
 from sentence_transformers import CrossEncoder
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class Reranker:
     def __init__(self, model_name: str = 'cross-encoder/ms-marco-MiniLM-L-6-v2'):
@@ -6,9 +9,9 @@ class Reranker:
         Initializes the Cross-Encoder model.
         """
         print(f"Loading Reranker model: {model_name}")
-        self.model = CrossEncoder(model_name)
+        self.model = CrossEncoder(model_name, device=device)
         
-    def rerank(self, query: str, documents: list, top_k: int = 5):
+    def rerank(self, query: str, documents: list, top_k: int = 10):
         """
         Re-ranks a list of documents based on relevance to the query.
         

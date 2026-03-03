@@ -10,7 +10,7 @@ from src.run_rag import ScientificRAGPipeline
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def fetch_qasper_sample(num_samples: int = 7) -> List[Dict]:
+def fetch_qasper_sample(num_samples: int = 10) -> List[Dict]:
     """
     Fetches a subset of the QASPER validation dataset, filtering for 
     questions that have a definitive free-form text answer.

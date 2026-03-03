@@ -12,7 +12,10 @@ import nltk
 
 # RAGAS specific imports
 from ragas import evaluate
-from ragas.metrics.collections import ContextPrecision, ContextRecall, Faithfulness, AnswerRelevancy
+from ragas.run_config import RunConfig
+
+# Import from ragas.metrics (classic API) — compatible with evaluate()
+from ragas.metrics import ContextPrecision, ContextRecall, Faithfulness, AnswerRelevancy
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 
@@ -137,23 +140,29 @@ def run_evaluation(input_csv: str = "data/evaluation_dataset.csv", output_csv: s
     # --- RAGAS EVALUATION ---
     eval_dataset = Dataset.from_pandas(df)
     metrics = [ContextPrecision(), ContextRecall(), Faithfulness(), AnswerRelevancy()]
-    
-    logging.info("Starting Local RAGAS Evaluation. (NOTE: This is CPU-bound and will take time)...")
+
+    # Increase timeout for local CPU/GPU inference (default 180s is too short for llama3)
+    run_config = RunConfig(
+        timeout=600,     # 10 minutes per LLM call
+        max_retries=2,
+        max_wait=30,
+    )
+
+    logging.info("Starting Local RAGAS Evaluation. (NOTE: This will take time with a local model)...")
     ragas_result = evaluate(
         dataset=eval_dataset,
         metrics=metrics,
         llm=ragas_llm,
         embeddings=ragas_embeddings,
-        raise_exceptions=False 
+        run_config=run_config,
+        raise_exceptions=False,
+        batch_size=1
     )
     
-    # Merge results
-    ragas_df = ragas_result.to_pandas()
-    final_df = pd.merge(
-        df[['question', 'ground_truth', 'answer', 'alce_citation_precision', 'alce_citation_recall']], 
-        ragas_df, 
-        on=['question', 'answer']
-    )
+    # Merge results — use concat by index since RAGAS 0.4.x drops original columns from result df
+    ragas_df = ragas_result.to_pandas().reset_index(drop=True)
+    base_df = df[['question', 'ground_truth', 'answer', 'alce_citation_precision', 'alce_citation_recall']].reset_index(drop=True)
+    final_df = pd.concat([base_df, ragas_df.drop(columns=[c for c in ['question', 'answer', 'ground_truth', 'contexts'] if c in ragas_df.columns], errors='ignore')], axis=1)
     
     # Save Report
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)

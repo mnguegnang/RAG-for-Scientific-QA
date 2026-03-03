@@ -1,12 +1,15 @@
 import faiss
 import numpy as np
 import pickle
+import torch
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 class DenseIndexer:
-    def __init__(self, model_name="BAAI/bge-small-en-v1.5", index_path="data/indices/dense.index"):
-        self.model = SentenceTransformer(model_name)
+    def __init__(self, model_name="BAAI/bge-small-en-v1.5", index_path="../data/indices/dense.index"):
+        self.model = SentenceTransformer(model_name, device=device)
         self.index_path = index_path
         self.dimension = 384 # Specific to BGE-Small
         self.index = None

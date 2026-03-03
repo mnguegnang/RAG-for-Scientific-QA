@@ -55,17 +55,17 @@ class ScientificRAGPipeline:
 
         # 2. RERANK (Precision)
         logging.info("Stage 2: Reranking candidates using Cross-Encoder...")
-        top_5_docs = self.reranker.rerank(query, broad_results, top_k=5)
+        top_10_docs = self.reranker.rerank(query, broad_results, top_k=10) # Keep top 10 for more context to the generator
         
         # 3. THE HANDOFF & GENERATION
-        logging.info("Stage 3: Passing top 5 documents to LLM to use as context for generation...")
+        logging.info("Stage 3: Passing top 10 documents to LLM to use as context for generation...")
         
         # The generator will stream the answer directly to the terminal, 
         # so we just let it execute.
-        final_answer = self.generator.generate_answer(query, top_5_docs)
+        final_answer = self.generator.generate_answer(query, top_10_docs)
         
         return {"answer": final_answer,
-                "retrieved_docs": top_5_docs}
+                "retrieved_docs": top_10_docs}
 
 def main():
     # Setup Argument Parser for Command Line Execution
