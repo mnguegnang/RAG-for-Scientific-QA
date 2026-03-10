@@ -1,14 +1,22 @@
+import logging
 import torch
 from sentence_transformers import CrossEncoder
 
+logger = logging.getLogger(__name__)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class Reranker:
-    def __init__(self, model_name: str = 'cross-encoder/ms-marco-MiniLM-L-6-v2'):
+    def __init__(self, model_name: str = 'BAAI/bge-reranker-base'):
         """
-        Initializes the Cross-Encoder model.
+        Initializes the Cross-Encoder reranker.
+
+        Default: BAAI/bge-reranker-base
+          - Trained on diverse (query, passage) pairs including academic text
+          - Outperforms ms-marco-MiniLM on BEIR academic subsets (SCIDOCS, SciFact)
+          - Zhang et al. (2023) https://huggingface.co/BAAI/bge-reranker-base
+          - Outputs raw logits; sigmoid(logit) > 0.5 ≈ relevant
         """
-        print(f"Loading Reranker model: {model_name}")
+        logger.info("Loading Reranker model: %s on device: %s", model_name, device)
         self.model = CrossEncoder(model_name, device=device)
         
     def rerank(self, query: str, documents: list, top_k: int = 10):

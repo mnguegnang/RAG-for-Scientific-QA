@@ -1,5 +1,3 @@
-# src/retrieval/sparse_store.py
-
 from rank_bm25 import BM25Okapi
 import pickle
 import nltk
@@ -15,7 +13,7 @@ except LookupError:
     nltk.download('punkt_tab')
 
 class SparseIndexer:
-    def __init__(self, index_path="../data/indices/sparse.pkl"):
+    def __init__(self, index_path="data/indices/sparse.pkl"):
         self.index_path = index_path
         self.bm25 = None
         self.corpus_chunks = []

@@ -2,6 +2,7 @@ import argparse
 import logging
 import sys
 import os
+import traceback
 
 # Import Retriever Components
 from src.retrieval.hybrid_retriever import HybridRetriever
@@ -17,55 +18,97 @@ class ScientificRAGPipeline:
     def __init__(self, 
                  dense_index_path: str = "data/indices/dense.index",
                  dense_meta_path: str = "data/indices/dense.index.meta",
-                 sparse_index_path: str = "data/indices/sparse.pkl"):
+                 sparse_index_path: str = "data/indices/sparse.pkl",
+                 generator_backend: str = "auto",
+                 ollama_model: str = "llama3",
+                 hf_model: str = "meta-llama/Llama-3.1-8B-Instruct"):
         """
         Initializes the entire end-to-end RAG system with the exact artifact paths.
         """
-        logging.info("Initializing the Hybrid Retriever...")
-        
-        # Load the physical index files from the hard drive into RAM
+        logging.info("Initializing the Hybrid Retriever (SPECTER2 encoder)...")
+
+        # SPECTER2: scientifically pre-trained, 768-dim (Singh et al., 2022)
+        # Query encoder must match the encoder used during ingestion (DenseIndexer)
         self.retriever = HybridRetriever(
-            dense_index_path=dense_index_path, 
+            dense_index_path=dense_index_path,
             dense_meta_path=dense_meta_path,
             sparse_index_path=sparse_index_path,
-            embedding_model_name="BAAI/bge-small-en-v1.5" # Ensure query embedding matches document embedding
+        )
+
+        logging.info("Initializing the Cross-Encoder Reranker (bge-reranker-base)...")
+        # BAAI/bge-reranker-base is ideal here since it outperforms ms-marco-MiniLM on academic BEIR subsets
+        self.reranker = Reranker(model_name="BAAI/bge-reranker-base")
+        
+        logging.info("Initializing the LLM Generator (backend=%s)...", generator_backend)
+        # backend="auto": uses transformers on GPU (supercomputer), ollama on CPU (laptop)
+        self.generator = LocalLLMGenerator(
+            backend=generator_backend,
+            ollama_model=ollama_model,
+            hf_model=hf_model,
         )
         
-        logging.info("Initializing the Cross-Encoder Reranker...")
-        self.reranker = Reranker(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
-        
-        logging.info("Initializing the Local LLM Generator (Ollama - llama3)...")
-        # Ensure Ollama is running (`ollama serve`)
-        self.generator = LocalLLMGenerator(model_name="llama3")
-        
         logging.info("System Ready.")
+
+    # CRAG relevance threshold (Yan et al., 2024 — Corrective RAG)
+    # bge-reranker-base outputs raw logits; sigmoid(0.0) = 0.5.
+    # A best-document logit below this value means no retrieved document
+    # is likely relevant — generation is suppressed to avoid hallucination.
+    # Tune empirically: raise towards 1.0 to be stricter, lower to be more permissive.
+    CRAG_THRESHOLD: float = 0.0
 
     def ask(self, query: str) -> dict:
         """
         Executes the full RAG pipeline for a given query.
+
+        Stages
+        ------
+        1. Hybrid retrieval  — top-50 candidates (dense + sparse via RRF)
+        2. Reranking         — bge-reranker-base narrows to top-7
+        3. CRAG gate         — suppresses generation when context is irrelevant
+        4. Generation        — Llama3 with CoT + citation prompt
         """
         logging.info(f"Processing Query: '{query}'")
-        
+
         # 1. RETRIEVE (Recall)
-        logging.info("Stage 1: Fetching top 50 candidates using Hybrid Search (Dense and Sparse)...")
+        logging.info("Stage 1: Fetching top 50 candidates via Hybrid Search (Dense + Sparse)...")
         broad_results = self.retriever.search(query, k=50)
-        
+
         if not broad_results:
-            return {"answer": "Error: No documents found in the database.", "retrieved_docs": []}
+            return {"answer": "Error: No documents found in the database.", "retrieved_docs": [],
+                    "crag_triggered": False}
 
         # 2. RERANK (Precision)
-        logging.info("Stage 2: Reranking candidates using Cross-Encoder...")
-        top_10_docs = self.reranker.rerank(query, broad_results, top_k=10) # Keep top 10 for more context to the generator
-        
-        # 3. THE HANDOFF & GENERATION
-        logging.info("Stage 3: Passing top 10 documents to LLM to use as context for generation...")
-        
-        # The generator will stream the answer directly to the terminal, 
-        # so we just let it execute.
-        final_answer = self.generator.generate_answer(query, top_10_docs)
-        
-        return {"answer": final_answer,
-                "retrieved_docs": top_10_docs}
+        # top_k=7: Liu et al. (2023) 'Lost in the Middle' shows LLM accuracy
+        # peaks with 3–5 high-quality passages we increase to 7 for more context.
+        logging.info("Stage 2: Reranking with bge-reranker-base, keeping top 7...")
+        top_7_docs = self.reranker.rerank(query, broad_results, top_k=7)
+
+        # 3. CRAG RELEVANCE GATE (Yan et al., 2024)
+        # Check the highest rerank score. If even the best document is below
+        # threshold, the retrieved context is too noisy for reliable generation.
+        best_score = max(d.get("rerank_score", 0.0) for d in top_7_docs)
+        logging.info(f"CRAG check — best rerank logit: {best_score:.4f} (threshold: {self.CRAG_THRESHOLD})")
+
+        if best_score < self.CRAG_THRESHOLD:
+            logging.warning("CRAG gate triggered: retrieved context below relevance threshold.")
+            return {
+                "answer": (
+                    "The retrieved documents do not contain enough information "
+                    "to answer this question reliably."
+                ),
+                "retrieved_docs": top_7_docs,
+                "crag_triggered": True,
+            }
+
+        # 4. GENERATION
+        logging.info("Stage 3: Passing top 7 documents to LLM for generation...")
+        final_answer = self.generator.generate_answer(query, top_7_docs)
+
+        return {
+            "answer": final_answer,
+            "retrieved_docs": top_7_docs,
+            "crag_triggered": False,
+        }
 
 def main():
     # Setup Argument Parser for Command Line Execution
@@ -76,7 +119,17 @@ def main():
     parser.add_argument("--dense-index", type=str, default="data/indices/dense.index")
     parser.add_argument("--dense-meta", type=str, default="data/indices/dense.index.meta")
     parser.add_argument("--sparse-index", type=str, default="data/indices/sparse.pkl")
-    
+    parser.add_argument("--crag-threshold", type=float, default=None,
+        help="Override the CRAG relevance gate threshold (bge-reranker raw logit). "
+             "Default: 0.0 (sigmoid=0.5, i.e., uncertain relevance)")
+    parser.add_argument("--backend", type=str, default="auto",
+        choices=["auto", "ollama", "transformers"],
+        help="LLM backend. 'auto' picks transformers on GPU, ollama on CPU (default: auto)")
+    parser.add_argument("--ollama-model", type=str, default="llama3",
+        help="Ollama model tag (used when backend=ollama, default: llama3)")
+    parser.add_argument("--hf-model", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
+        help="HuggingFace model ID (used when backend=transformers)")
+
     args = parser.parse_args()
 
     try:
@@ -84,18 +137,36 @@ def main():
         rag_system = ScientificRAGPipeline(
             dense_index_path=args.dense_index,
             dense_meta_path=args.dense_meta,
-            sparse_index_path=args.sparse_index
+            sparse_index_path=args.sparse_index,
+            generator_backend=args.backend,
+            ollama_model=args.ollama_model,
+            hf_model=args.hf_model,
         )
+        if args.crag_threshold is not None:
+            rag_system.CRAG_THRESHOLD = args.crag_threshold
+            logging.info(f"CRAG threshold overridden to {args.crag_threshold}")
         
         print("\n" + "*"*60)
         print(f"QUESTION: {args.query}")
         print("*"*60 + "\n")
         
-        # Execute the pipeline. The streaming UI will handle printing the response.
-        _ = rag_system.ask(args.query)
+        result = rag_system.ask(args.query)
+
+        print("\n" + "="*60)
+        print("ANSWER:")
+        print("="*60)
+        print(result["answer"])
+
+        if result.get("crag_triggered"):
+            print("\n[CRAG] Generation suppressed: retrieved context below relevance threshold.")
+
+        print("\n" + "-"*60)
+        print(f"Retrieved {len(result['retrieved_docs'])} documents used as context.")
+        print("-"*60 + "\n")
         
     except Exception as e:
         logging.error(f"Pipeline crashed: {e}")
+        logging.error(traceback.format_exc())
         sys.exit(1)
 
 if __name__ == "__main__":

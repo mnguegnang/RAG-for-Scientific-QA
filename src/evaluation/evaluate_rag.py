@@ -138,14 +138,33 @@ def run_evaluation(input_csv: str = "data/evaluation_dataset.csv", output_csv: s
     df['alce_citation_recall'] = recalls
     
     # --- RAGAS EVALUATION ---
+    # RAGAS receives the full top-10 reranked contexts, identical to what ALCE uses.
+    # Giving RAGAS all 10 docs ensures ContextRecall can find every relevant chunk
+    # and Faithfulness/ContextPrecision have the complete evidence set to grade against.
     eval_dataset = Dataset.from_pandas(df)
     metrics = [ContextPrecision(), ContextRecall(), Faithfulness(), AnswerRelevancy()]
 
-    # Increase timeout for local CPU/GPU inference (default 180s is too short for llama3)
+    # --- RunConfig tuned for a single local CPU Ollama instance ---
+    #
+    # max_workers=1  Ollama serialises all requests (one llama3 process, no true
+    #                parallelism). Sending >1 concurrent job means later jobs wait
+    #                in Ollama's queue while the timeout clock is already ticking —
+    #                structurally guaranteed TimeoutErrors. Set to 1 to match reality.
+    #
+    # timeout=2400   40 min per call. top_k=10 roughly doubles the prompt length
+    #                compared to top_k=5. llama3 on CPU needs 10–30 min to grade
+    #                one row with 10 full contexts; 2400 s covers the worst case.
+    #
+    # max_retries=2  Local failures are slow inference, not transient network blips.
+    #                The default 10 retries × 2400 s = up to 6.7 h wasted on one
+    #                row before recording NaN. 2 retries catches rare Ollama hiccups.
+    #
+    # max_wait=30    Short back-off is fine; no rate-limited remote API to respect.
     run_config = RunConfig(
-        timeout=600,     # 10 minutes per LLM call
-        max_retries=2,
-        max_wait=30,
+        timeout=2400,    # 40 min per LLM call — covers top_k=10 contexts on CPU
+        max_retries=2,   # low: failures are slow inference, not network blips
+        max_wait=30,     # short back-off; no rate-limit to respect
+        max_workers=1,   # CRITICAL: matches Ollama's true concurrency (serial)
     )
 
     logging.info("Starting Local RAGAS Evaluation. (NOTE: This will take time with a local model)...")
@@ -168,13 +187,22 @@ def run_evaluation(input_csv: str = "data/evaluation_dataset.csv", output_csv: s
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     final_df.to_csv(output_csv, index=False)
     
+    def _fmt(series: pd.Series) -> str:
+        """Mean of valid (non-NaN) values; reports how many jobs timed out."""
+        valid = series.dropna()
+        if len(valid) == 0:
+            return f"N/A — all {len(series)} rows failed (timeout/NaN)"
+        n_failed = len(series) - len(valid)
+        suffix = f"  [{n_failed} NaN/timeout skipped]" if n_failed > 0 else ""
+        return f"{valid.mean():.4f}{suffix}"
+
     logging.info("\n========== LOCAL EVALUATION REPORT ==========")
-    logging.info(f"Context Precision:  {final_df.get('context_precision', pd.Series([0])).mean():.4f}")
-    logging.info(f"Context Recall:     {final_df.get('context_recall', pd.Series([0])).mean():.4f}")
-    logging.info(f"Faithfulness:       {final_df.get('faithfulness', pd.Series([0])).mean():.4f}")
-    logging.info(f"Answer Relevancy:   {final_df.get('answer_relevancy', pd.Series([0])).mean():.4f}")
-    logging.info(f"ALCE Citation Precision:      {final_df['alce_citation_precision'].mean():.4f}")
-    logging.info(f"ALCE Citation Recall:         {final_df['alce_citation_recall'].mean():.4f}")
+    logging.info(f"Context Precision:       {_fmt(final_df.get('context_precision', pd.Series(dtype=float)))}")
+    logging.info(f"Context Recall:          {_fmt(final_df.get('context_recall', pd.Series(dtype=float)))}")
+    logging.info(f"Faithfulness:            {_fmt(final_df.get('faithfulness', pd.Series(dtype=float)))}")
+    logging.info(f"Answer Relevancy:        {_fmt(final_df.get('answer_relevancy', pd.Series(dtype=float)))}")
+    logging.info(f"ALCE Citation Precision: {_fmt(final_df['alce_citation_precision'])}")
+    logging.info(f"ALCE Citation Recall:    {_fmt(final_df['alce_citation_recall'])}")
     logging.info("======================================================")
 
 if __name__ == "__main__":

@@ -1,17 +1,17 @@
 import os
-from data.make_dataset import load_and_inspect_qasper
-from retrieval.chunking import QasperChunker
-from retrieval.vector_store import DenseIndexer
-from retrieval.sparse_store import SparseIndexer
+from src.data.make_dataset import load_and_inspect_qasper
+from src.retrieval.chunking import QasperChunker
+from src.retrieval.vector_store import DenseIndexer
+from src.retrieval.sparse_store import SparseIndexer
 
 def run_ingestion_pipeline():
     print("=== Data Ingestion & Indexing ===")    
     # 1. Load Data
     raw_data = load_and_inspect_qasper()
     
-    # Fo Development phase: Limit to 50 papers to keep processing time under 2 minutes
+    # For Development phase: Limit to 50 papers to keep processing time under 2 minutes
     # In production, we will use the whole dataset i.e., len(raw_data) = 1585 papers
-    subset_data = [raw_data[i] for i in range(50)] 
+    subset_data = [raw_data[i] for i in range(len(raw_data))] 
     print(f"Processing subset of {len(subset_data)} papers.")
     
     # 2. Chunking

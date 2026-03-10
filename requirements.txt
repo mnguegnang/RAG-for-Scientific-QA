@@ -1,15 +1,25 @@
-# local package
+#To install local package in the current directory (editable mode) to allow imports from src/ and notebooks/
 -e .
 
 # external requirements
+# python==3.10.19  # managed by conda, not pip — use: conda create -n qasper-rag python=3.10
 numpy==2.2.6
 pandas==2.3.3
 datasets==2.21.0 #4.5.0 downgrade from 4.5.0 to 2.21.0 to avoid compatibility issues with other packages
+
 sentence-transformers==5.2.3
-faiss-cpu==1.13.2
+# faiss: install via conda (supports both CPU and GPU, latest versions only on conda-forge/pytorch channel)
+#   CPU (laptop):  conda install -c pytorch faiss-cpu=1.9.0
+#   GPU (A100):    conda install -c pytorch -c nvidia faiss-gpu=1.9.0 pytorch-cuda=12.1
+# faiss-cpu==1.13.2  ← pip version, kept for reference only
+adapters==1.0.1 # AllenAI adapter library required for allenai/specter2_base
 nltk==3.9.3
 rank-bm25==0.2.2
 ollama==0.6.1
-fastapi==0.133.0
-uvicorn[standard]==0.41.0
+accelerate>=0.30.0  # Required for device_map="auto" in HuggingFace transformers (GPU backend)
+#fastapi==0.133.0
+langchain-ollama==1.0.1 
+ragas==0.4.3
+
+#uvicorn[standard]==0.41.0
 python-dotenv>=0.5.1

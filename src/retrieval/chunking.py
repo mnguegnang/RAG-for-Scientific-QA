@@ -4,6 +4,11 @@ from typing import List, Dict
 class QasperChunker:
     def __init__(self, model_name="BAAI/bge-small-en-v1.5", max_tokens=512, overlap_pct=0.1):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # We manage all length splitting ourselves — setting model_max_length to a
+        # large value prevents the HuggingFace tokenizer from emitting the
+        # "Token indices sequence length is longer than..." warning on every long
+        # paragraph, which would otherwise flood the console.
+        self.tokenizer.model_max_length = int(1e30)
         self.max_tokens = max_tokens
         # Calculate overlap tokens (e.g., 512 * 0.1 = ~51 tokens)
         self.overlap_tokens = int(max_tokens * overlap_pct)
