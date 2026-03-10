@@ -1,8 +1,22 @@
+# Retrieval Diagnostic Script
+# ----------------------------
+# Developer-only for testing the retrieval HybridRetriever and Reranker
+# in isolation without invoking the LLM generator.
+#
+# Typical use cases:
+#   1. Smoke-test after re-ingestion: verify the FAISS/BM25 indices load correctly.
+#   2. Debug context quality: inspect raw retrieval and rerank scores for a query
+#      before attributing failures to the LLM.
+#   3. Calibrate the CRAG threshold: observe bge-reranker-base logits on known queries.
+#
+# Not part of the production pipeline. Nothing imports this module.
+# Run with:  python -m src.pipeline_retrieve
+
 from src.retrieval.hybrid_retriever import HybridRetriever
 from src.retrieval.reranker import Reranker
 import os
 
-# CONFIG
+# CONFIG — pointing to SPECTER2 indices inside the project.
 DENSE_INDEX = 'data/indices/dense.index'
 DENSE_META = 'data/indices/dense.index.meta'
 SPARSE_INDEX = 'data/indices/sparse.pkl'

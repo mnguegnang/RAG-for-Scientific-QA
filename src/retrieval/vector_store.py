@@ -2,18 +2,20 @@ import faiss
 import numpy as np
 import pickle
 import torch
-from sentence_transformers import SentenceTransformer
 from typing import List, Dict
+from src.retrieval.encoders import Specter2Encoder
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class DenseIndexer:
-    def __init__(self, model_name="BAAI/bge-small-en-v1.5", index_path="../data/indices/dense.index"):
-        self.model = SentenceTransformer(model_name, device=device)
+    def __init__(self, index_path="data/indices/dense.index"):
+        # SPECTER2: scientifically pre-trained encoder (Singh et al., 2022, SciRepEval)
+        # Dimension 768 vs. 384 for bge-small — richer representation for scientific text
+        self.model = Specter2Encoder(device=device)
         self.index_path = index_path
-        self.dimension = 384 # Specific to BGE-Small
+        self.dimension = Specter2Encoder.DIMENSION  # 768
         self.index = None
-        self.metadata_store = [] # FAISS only stores numbers; we need to store the text separately
+        self.metadata_store = []  # FAISS only stores numbers; we need to store the text separately
 
     def build_index(self, chunks: List[Dict]):
         print(f"Generating embeddings for {len(chunks)} chunks...")

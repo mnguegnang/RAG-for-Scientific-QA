@@ -1,25 +1,27 @@
 import faiss
 import pickle
+import logging
 import numpy as np
 import torch
-from sentence_transformers import SentenceTransformer
 from collections import defaultdict
+from src.retrieval.encoders import Specter2Encoder
 
+logger = logging.getLogger(__name__)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class HybridRetriever:
     def __init__(self, 
                  dense_index_path: str, 
                  dense_meta_path: str, 
-                 sparse_index_path: str,
-                 embedding_model_name: str = "BAAI/bge-small-en-v1.5"):
+                 sparse_index_path: str):
         
-        # 1. Load Embedding Model (for query encoding)
-        print("Loading Embedding Model...")
-        self.encoder = SentenceTransformer(embedding_model_name, device=device)
+        # 1. Load SPECTER2 Encoder (for query encoding)
+        # Must match the encoder used at ingestion time (DenseIndexer)
+        logger.info("Loading SPECTER2 Encoder...")
+        self.encoder = Specter2Encoder(device=device)
         
         # 2. Load Dense Index (FAISS)
-        print(f"Loading FAISS Index from {dense_index_path}...")
+        logger.info("Loading FAISS Index from %s...", dense_index_path)
         self.dense_index = faiss.read_index(dense_index_path)
         
         # 3. Load Metadata (To map FAISS IDs back to text)
@@ -27,7 +29,7 @@ class HybridRetriever:
             self.dense_meta = pickle.load(f)
             
         # 4. Load Sparse Index (BM25)
-        print(f"Loading BM25 Index from {sparse_index_path}...")
+        logger.info("Loading BM25 Index from %s...", sparse_index_path)
         with open(sparse_index_path, 'rb') as f:
             self.bm25_package = pickle.load(f)
             # The pickle contains the object and the corpus, we unpack it
