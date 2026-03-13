@@ -9,8 +9,7 @@ def run_ingestion_pipeline():
     # 1. Load Data
     raw_data = load_and_inspect_qasper()
     
-    # For Development phase: Limit to 50 papers to keep processing time under 2 minutes
-    # In production, we will use the whole dataset i.e., len(raw_data) = 1585 papers
+    # We load the whole train  len(raw_data) = 1585 papers
     subset_data = [raw_data[i] for i in range(len(raw_data))] 
     print(f"Processing subset of {len(subset_data)} papers.")
     

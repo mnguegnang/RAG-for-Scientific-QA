@@ -1,0 +1,15 @@
+========================================
+Job ID    : 27741
+Node      : cc-gpu02-n01
+Start     : 23:39:53
+========================================
+0, NVIDIA A100-SXM4-80GB, 81920 MiB, 81156 MiB
+1, NVIDIA A100-SXM4-80GB, 81920 MiB, 81156 MiB
+2, NVIDIA A100-SXM4-80GB, 81920 MiB, 81156 MiB
+PyTorch : 2.6.0+cu124
+CUDA    : True
+GPUs    : 3
+--- Starting pipeline_ingest.py at 23:39:57 ---
+=== Data Ingestion & Indexing ===
+Loading QASPER dataset from HuggingFace...
+--- Finished at 23:40:08 with exit code 1 ---

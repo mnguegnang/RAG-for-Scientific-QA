@@ -42,7 +42,14 @@ class Specter2Encoder:
     ADAPTER_NAME = "allenai/specter2"  # retrieval adapter on HF Hub
     DIMENSION = 768
 
-    def __init__(self, device: str = _DEVICE):
+    def __init__(self, device: str = _DEVICE, model_kwargs: dict = None):
+        """
+        Added `model_kwargs` to allow passing optimization flags (like torch.float16)
+        down to the underlying HuggingFace adapter model.
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+
         try:
             from adapters import AutoAdapterModel  # type: ignore
         except ImportError as e:
@@ -54,8 +61,10 @@ class Specter2Encoder:
         logger.info("Loading SPECTER2 tokenizer from %s ...", self.BASE_MODEL)
         self.tokenizer = AutoTokenizer.from_pretrained(self.BASE_MODEL)
 
-        logger.info("Loading SPECTER2 base model ...")
-        self.model = AutoAdapterModel.from_pretrained(self.BASE_MODEL)
+        logger.info("Loading SPECTER2 base model with kwargs: %s ...", model_kwargs)
+        # **model_kwargs unpacks the dictionary, passing torch_dtype=torch.float16 
+        # to HuggingFace, drastically reducing VRAM usage.
+        self.model = AutoAdapterModel.from_pretrained(self.BASE_MODEL, **model_kwargs)
 
         logger.info("Loading SPECTER2 retrieval adapter (%s) ...", self.ADAPTER_NAME)
         self.model.load_adapter(
@@ -64,6 +73,14 @@ class Specter2Encoder:
             load_as="specter2_retrieval",
             set_active=True,
         )
+        # We explicitly activate the adapter to remove the warning and ensure 
+        # the we are actually getting SPECTER2 retrieval embeddings, not base BERT.
+        self.model.active_adapters = "specter2_retrieval"
+
+        # We force any dynamically added adapter layers to match the base model's dtype.
+        # If the base model is FP16, this converts the 32-bit adapter weights to 16-bit.
+        if model_kwargs.get("torch_dtype") == torch.float16:
+            self.model.half()
 
         self.device = device
         self.model.to(device)
@@ -110,8 +127,12 @@ class Specter2Encoder:
                 return_tensors="pt",
             ).to(self.device)
 
+            # autocast() acts as a safety net. It automatically coordinates 
+            # FP16 and FP32 operations at the hardware level, preventing mat1/mat2 crashes.
             with torch.no_grad():
-                outputs = self.model(**inputs)
+                device_type = "cuda" if "cuda" in self.device else "cpu"
+                with torch.autocast(device_type=device_type):
+                    outputs = self.model(**inputs)
 
             # CLS-token pooling — recommended by AllenAI for SPECTER2
             cls_embeddings = outputs.last_hidden_state[:, 0, :]
@@ -121,4 +142,6 @@ class Specter2Encoder:
 
             all_embeddings.append(cls_embeddings.cpu().numpy())
 
+        # Crucial for FAISS: Even if the model computed these in float16,
+        # we cast back to float32 here before returning.
         return np.vstack(all_embeddings).astype("float32")

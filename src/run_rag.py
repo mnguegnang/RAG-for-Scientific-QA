@@ -35,9 +35,9 @@ class ScientificRAGPipeline:
             sparse_index_path=sparse_index_path,
         )
 
-        logging.info("Initializing the Cross-Encoder Reranker (bge-reranker-base)...")
-        # BAAI/bge-reranker-base is ideal here since it outperforms ms-marco-MiniLM on academic BEIR subsets
-        self.reranker = Reranker(model_name="BAAI/bge-reranker-base")
+        logging.info("Initializing the Cross-Encoder Reranker (bge-reranker-v2-m3)...")
+        # We place BAAI/bge-reranker-base with 'BAAI/bge-reranker-v2-m3' is ideal here since it outperforms ms-marco-MiniLM on academic BEIR subsets
+        self.reranker = Reranker(model_name="BAAI/bge-reranker-v2-m3")
         
         logging.info("Initializing the LLM Generator (backend=%s)...", generator_backend)
         # backend="auto": uses transformers on GPU (supercomputer), ollama on CPU (laptop)
