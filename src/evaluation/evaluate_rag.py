@@ -14,8 +14,11 @@ import nltk
 # RAGAS specific imports
 from ragas import evaluate
 from ragas.run_config import RunConfig
-from ragas.metrics.collections import ContextPrecision, ContextRecall, Faithfulness, AnswerRelevancy
-from ragas.embeddings import LangchainEmbeddingsWrapper
+from ragas.metrics._context_precision import ContextPrecision
+from ragas.metrics._context_recall import ContextRecall
+from ragas.metrics._faithfulness import Faithfulness
+from ragas.metrics._answer_relevance import AnswerRelevancy
+from ragas.embeddings import HuggingFaceEmbeddings as RagasHuggingFaceEmbeddings
 from ragas.llms import llm_factory
 from openai import OpenAI
 
@@ -23,7 +26,6 @@ from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langchain_ollama import ChatOllama
-from langchain_huggingface import HuggingFaceEmbeddings
 
 # Globally force HuggingFace to trust custom architectures (Fixes the Nomic bug)
 os.environ["HF_TRUST_REMOTE_CODE"] = "1"
@@ -138,21 +140,13 @@ def get_hardware_aware_models():
             temperature=0.0
         )
         
-        # 4. FIX: Use LangChain's HuggingFace wrapper which correctly passes trust_remote_code
-        #lc_embeddings = HuggingFaceEmbeddings(
-        #    model_name="nomic-ai/nomic-embed-text-v1.5",
-        #    model_kwargs={'device': 'cuda', 'trust_remote_code': True},
-        #    encode_kwargs={'normalize_embeddings': True}
-        #)
-        #ragas_embeddings = LangchainEmbeddingsWrapper(lc_embeddings)
-
-        # The os.environ["HF_TRUST_REMOTE_CODE"] = "1" at the top makes this safe!
-        lc_embeddings = HuggingFaceEmbeddings(
-            model_name="nomic-ai/nomic-embed-text-v1.5",
-            model_kwargs={"device": "cuda", "trust_remote_code": True},
-            encode_kwargs={"normalize_embeddings": True},
+        # 4. Use RAGAS native HuggingFace embeddings
+        ragas_embeddings = RagasHuggingFaceEmbeddings(
+            model="nomic-ai/nomic-embed-text-v1.5",
+            device="cuda",
+            trust_remote_code=True,
+            normalize_embeddings=True,
         )
-        ragas_embeddings = LangchainEmbeddingsWrapper(lc_embeddings)
 
     else:
         logging.info("No GPU Detected. Connecting to local Ollama server...")
@@ -166,13 +160,13 @@ def get_hardware_aware_models():
         ragas_llm = llm_factory(model="llama3", client=ollama_client)
         local_judge_llm = ChatOllama(model="llama3", temperature=0.0)
         
-        # CPU Fallback also uses LangChain wrapper
-        lc_embeddings = HuggingFaceEmbeddings(
-            model_name="nomic-ai/nomic-embed-text-v1.5",
-            model_kwargs={'device': 'cpu', 'trust_remote_code': True},
-            encode_kwargs={'normalize_embeddings': True}
+        # CPU Fallback uses RAGAS native HuggingFace embeddings
+        ragas_embeddings = RagasHuggingFaceEmbeddings(
+            model="nomic-ai/nomic-embed-text-v1.5",
+            device="cpu",
+            trust_remote_code=True,
+            normalize_embeddings=True,
         )
-        ragas_embeddings = LangchainEmbeddingsWrapper(lc_embeddings)
         
     return local_judge_llm, ragas_llm, ragas_embeddings, is_gpu
 
@@ -213,10 +207,7 @@ def run_evaluation(input_csv: str = None, output_csv: str = None):
     
     # --- RAGAS EVALUATION ---
     eval_dataset = Dataset.from_pandas(df)
-    metrics = [ContextPrecision(llm=ragas_llm), 
-               ContextRecall(llm=ragas_llm), 
-               Faithfulness(llm=ragas_llm), 
-               AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings)]
+    metrics = [ContextPrecision(), ContextRecall(), Faithfulness(), AnswerRelevancy()]
 
     # 2. DYNAMIC HARDWARE CONFIGURATION
     if is_gpu:
@@ -239,8 +230,8 @@ def run_evaluation(input_csv: str = None, output_csv: str = None):
     ragas_result = evaluate(
         dataset=eval_dataset,
         metrics=metrics,
-        #llm=ragas_llm,
-        #embeddings=ragas_embeddings,
+        llm=ragas_llm,
+        embeddings=ragas_embeddings,
         run_config=run_config,
         raise_exceptions=False,
         #batch_size=eval_batch_size  # Automatically scales based on hardware

@@ -29,7 +29,7 @@ VLLM_PID=$!
 
 # 3. Wait for vLLM to become ready (poll health endpoint instead of blind sleep)
 echo "Waiting for vLLM server to be ready..."
-MAX_WAIT=300  # 5-minute timeout
+MAX_WAIT=900  # 15-minute timeout
 ELAPSED=0
 until curl -sf http://localhost:8000/health > /dev/null 2>&1; do
     if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
