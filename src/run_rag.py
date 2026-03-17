@@ -35,9 +35,15 @@ class ScientificRAGPipeline:
             sparse_index_path=sparse_index_path,
         )
 
-        logging.info("Initializing the Cross-Encoder Reranker (bge-reranker-base)...")
-        # BAAI/bge-reranker-base is ideal here since it outperforms ms-marco-MiniLM on academic BEIR subsets
-        self.reranker = Reranker(model_name="BAAI/bge-reranker-base")
+<<<<<<< HEAD
+        logging.info("Initializing the Cross-Encoder Reranker (bge-reranker-v2-m3)...")
+        # We place BAAI/bge-reranker-base with 'BAAI/bge-reranker-v2-m3' is ideal here since it outperforms ms-marco-MiniLM on academic BEIR subsets
+        self.reranker = Reranker(model_name="BAAI/bge-reranker-v2-m3")
+=======
+        logging.info("Initializing the Cross-Encoder Reranker (bge-reranker-v2-m3)...")
+        # We place BAAI/bge-reranker-base with 'BAAI/bge-reranker-v2-m3' is ideal here since it outperforms ms-marco-MiniLM on academic BEIR subsets
+        self.reranker = Reranker(model_name="BAAI/bge-reranker-v2-m3")
+>>>>>>> cc6e01ad33bfbf2fa9000592545c986b7eeb4561
         
         logging.info("Initializing the LLM Generator (backend=%s)...", generator_backend)
         # backend="auto": uses transformers on GPU (supercomputer), ollama on CPU (laptop)
@@ -80,7 +86,11 @@ class ScientificRAGPipeline:
         # 2. RERANK (Precision)
         # top_k=7: Liu et al. (2023) 'Lost in the Middle' shows LLM accuracy
         # peaks with 3–5 high-quality passages we increase to 7 for more context.
+<<<<<<< HEAD
         logging.info("Stage 2: Reranking with bge-reranker-base, keeping top 7...")
+=======
+        logging.info("Stage 2: Reranking with bge-reranker-v2-m3, keeping top 7...")
+>>>>>>> cc6e01ad33bfbf2fa9000592545c986b7eeb4561
         top_7_docs = self.reranker.rerank(query, broad_results, top_k=7)
 
         # 3. CRAG RELEVANCE GATE (Yan et al., 2024)
@@ -109,6 +119,7 @@ class ScientificRAGPipeline:
             "retrieved_docs": top_7_docs,
             "crag_triggered": False,
         }
+<<<<<<< HEAD
 
     def ask_stream(self, query: str):
         """
@@ -158,6 +169,8 @@ class ScientificRAGPipeline:
         logging.info("Stage 3: Streaming generation...")
         token_generator = self.generator.generate_stream(query, top_7_docs)
         return context_strings, token_generator
+=======
+>>>>>>> cc6e01ad33bfbf2fa9000592545c986b7eeb4561
 
 def main():
     # Setup Argument Parser for Command Line Execution

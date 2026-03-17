@@ -219,44 +219,6 @@ class LocalLLMGenerator:
         print(answer)
         print("\n" + "="*92 + "\n")
         return answer
-
-    # ── Streaming method (used by the serving API) ────────────────────────────
-    def generate_stream(self, query: str, retrieved_docs: List[Dict[str, Any]]):
-        """
-        Yields tokens one-by-one from Ollama for real-time streaming to the UI.
-        Falls back to yielding the full answer in one chunk for the transformers backend.
-        """
-        if not retrieved_docs:
-            yield "No documents were retrieved. Cannot generate an answer."
-            return
-
-        full_prompt = self._build_prompt(query, retrieved_docs)
-
-        if self.backend == "ollama":
-            payload = {
-                "model": self.model_name,
-                "prompt": full_prompt,
-                "stream": True,
-                "options": {"temperature": 0.1},
-            }
-            try:
-                logging.info("[LLMGenerator] Streaming tokens from Ollama at %s...", self.api_url)
-                response = requests.post(self.api_url, json=payload, stream=True, timeout=1200)
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    if line:
-                        body = json.loads(line.decode("utf-8"))
-                        token = body.get("response", "")
-                        if token:
-                            yield token
-                        if body.get("done"):
-                            break
-            except requests.exceptions.RequestException as e:
-                logging.error("[LLMGenerator] Ollama streaming connection failed: %s", e)
-                yield f"System Error: Could not connect to Ollama. Is 'ollama serve' running? ({e})"
-            except json.JSONDecodeError as e:
-                logging.error("[LLMGenerator] JSON parse error during streaming: %s", e)
-                yield "System Error: JSON Parsing Failure."
-        else:
-            # transformers backend: generate the full answer then yield it as a single chunk
-            yield self._generate_transformers(full_prompt)
+=======
+        return answer
+>>>>>>> cc6e01ad33bfbf2fa9000592545c986b7eeb4561

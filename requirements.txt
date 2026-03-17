@@ -12,7 +12,7 @@ sentence-transformers==5.2.3
 #   CPU (laptop):  conda install -c pytorch faiss-cpu=1.9.0
 #   GPU (A100):    conda install -c pytorch -c nvidia faiss-gpu=1.9.0 pytorch-cuda=12.1
 # faiss-cpu==1.13.2  ← pip version, kept for reference only
-adapters==1.0.1 # AllenAI adapter library required for allenai/specter2_base
+# adapters==1.0.1 # AllenAI adapter library required for allenai/specter2_base (commented out due to transformers dependency issue; use adapters==1.2.0 below)
 nltk==3.9.3
 rank-bm25==0.2.2
 ollama==0.6.1
@@ -20,6 +20,8 @@ accelerate>=0.30.0  # Required for device_map="auto" in HuggingFace transformers
 #fastapi==0.133.0
 langchain-ollama==1.0.1 
 ragas==0.4.3
+
+adapters==1.2.0
 
 #uvicorn[standard]==0.41.0
 python-dotenv>=0.5.1
