@@ -3,6 +3,7 @@ import re
 import json
 import logging
 import pandas as pd
+from pathlib import Path
 from datasets import load_dataset
 from typing import List, Dict
 
@@ -95,11 +96,15 @@ def fetch_qasper_sample(num_samples: int = 10) -> List[Dict]:
             
     return qa_pairs
 
-def generate_evaluation_dataset(output_path: str = "data/evaluation_dataset.csv"):
+def generate_evaluation_dataset(output_path: str = None):
     """
     Passes QASPER questions through the RAG Pipeline and formats 
     the output exactly as RAGAS expects.
     """
+    _project_root = Path(__file__).resolve().parents[2]
+    if output_path is None:
+        output_path = str(_project_root / "data" / "evaluation_dataset.csv")
+
     # 1. Initialize the Orchestrator (loads FAISS, Cross-Encoder, Ollama)
     logging.info("Initializing Scientific RAG Pipeline...")
     rag_pipeline = ScientificRAGPipeline(

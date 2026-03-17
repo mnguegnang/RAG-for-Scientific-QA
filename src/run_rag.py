@@ -80,7 +80,7 @@ class ScientificRAGPipeline:
         # 2. RERANK (Precision)
         # top_k=7: Liu et al. (2023) 'Lost in the Middle' shows LLM accuracy
         # peaks with 3–5 high-quality passages we increase to 7 for more context.
-        logging.info("Stage 2: Reranking with bge-reranker-base, keeping top 7...")
+        logging.info("Stage 2: Reranking with bge-reranker-v2-m3, keeping top 7...")
         top_7_docs = self.reranker.rerank(query, broad_results, top_k=7)
 
         # 3. CRAG RELEVANCE GATE (Yan et al., 2024)

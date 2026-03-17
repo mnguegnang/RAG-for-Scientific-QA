@@ -4,6 +4,7 @@ import re
 import logging
 import pandas as pd
 import torch
+from pathlib import Path
 from typing import Tuple
 from datasets import Dataset
 
@@ -13,24 +14,16 @@ import nltk
 # RAGAS specific imports
 from ragas import evaluate
 from ragas.run_config import RunConfig
-
-# FIX: Use modern RAGAS import paths to remove DeprecationWarnings
 from ragas.metrics.collections import ContextPrecision, ContextRecall, Faithfulness, AnswerRelevancy
-from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
-from openai import OpenAI
 from ragas.llms import llm_factory
-from ragas.embeddings import HuggingFaceEmbeddings as RagasHFEmbeddings
-
+from openai import OpenAI
 
 # LangChain Imports
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
-from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain_huggingface import HuggingFacePipeline, HuggingFaceEmbeddings
-
-# Transformers Imports (For GPU execution)
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from langchain_ollama import ChatOllama
+from langchain_huggingface import HuggingFaceEmbeddings
 
 # Globally force HuggingFace to trust custom architectures (Fixes the Nomic bug)
 os.environ["HF_TRUST_REMOTE_CODE"] = "1"
@@ -154,7 +147,12 @@ def get_hardware_aware_models():
         #ragas_embeddings = LangchainEmbeddingsWrapper(lc_embeddings)
 
         # The os.environ["HF_TRUST_REMOTE_CODE"] = "1" at the top makes this safe!
-        ragas_embeddings = RagasHFEmbeddings(model="nomic-ai/nomic-embed-text-v1.5")
+        lc_embeddings = HuggingFaceEmbeddings(
+            model_name="nomic-ai/nomic-embed-text-v1.5",
+            model_kwargs={"device": "cuda", "trust_remote_code": True},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+        ragas_embeddings = LangchainEmbeddingsWrapper(lc_embeddings)
 
     else:
         logging.info("No GPU Detected. Connecting to local Ollama server...")
@@ -178,8 +176,14 @@ def get_hardware_aware_models():
         
     return local_judge_llm, ragas_llm, ragas_embeddings, is_gpu
 
-def run_evaluation(input_csv: str = "data/evaluation_dataset.csv", output_csv: str = "data/evaluation_report.csv"):
+def run_evaluation(input_csv: str = None, output_csv: str = None):
     
+    _project_root = Path(__file__).resolve().parents[2]
+    if input_csv is None:
+        input_csv = str(_project_root / "data" / "evaluation_dataset.csv")
+    if output_csv is None:
+        output_csv = str(_project_root / "data" / "evaluation_report.csv")
+
     logging.info(f"Loading generated dataset from {input_csv}...")
     df = pd.read_csv(input_csv)
     df['contexts'] = df['contexts'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)

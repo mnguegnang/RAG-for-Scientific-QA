@@ -24,7 +24,7 @@ conda activate qasper-rag
 
 # Point HF cache to scratch space — avoids filling your home quota
 export HF_HOME="/scratch/$USER/.cache/huggingface"
-export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+
 
 # PyTorch / parallelism
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
