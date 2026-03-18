@@ -140,6 +140,7 @@ class LocalLLMGenerator:
 </Context>
 
 <Instructions>
+0. Paper Focus: First, identify which single document is most directly relevant to the question. Anchor your answer primarily to that document. Mention other documents only if they add genuinely complementary information.
 1. Comprehension: Read the context carefully. If the context does not contain the answer, reply exactly with: "The retrieved documents do not contain enough information to answer this." Do not guess.
 2. Chain of Thought: Provide a brief <Reasoning> section where you outline your logic based on the documents.
 3. Citations: Provide a <Final Answer> section. Every factual claim MUST end with the citation tag of the document it originated from, e.g., [Doc 1] or [Doc 2].

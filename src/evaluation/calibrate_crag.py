@@ -7,7 +7,7 @@ irrelevant retrievals and identifies the F1-maximising threshold.
 
 Usage (from project root):
     python -m src.evaluation.calibrate_crag
-    python -m src.evaluation.calibrate_crag --eval-csv data/evaluation_dataset.csv
+    python -m src.evaluation.calibrate_crag --eval-csv data/evaluation_report.csv
 
 Output:
     • Console table: per-query max reranker logit vs. context_recall label
@@ -47,8 +47,8 @@ def _load_eval_data(eval_csv: str) -> pd.DataFrame:
     """
     Load the evaluation CSV and derive binary relevance labels.
 
-    Accepts either evaluation_dataset.csv (which already includes RAGAS metric
-    columns written by evaluate_rag.py) or evaluation_report.csv.
+    Accepts evaluation_report.csv (written by evaluate_rag.py), which contains
+    the RAGAS context_recall column needed to derive relevance labels.
     Required columns: one of {'question', 'user_input'} and 'context_recall'.
     """
     df = pd.read_csv(eval_csv)
@@ -260,8 +260,8 @@ def main() -> None:
     )
     parser.add_argument(
         '--eval-csv',
-        default=str(_PROJECT_ROOT / 'data' / 'evaluation_dataset.csv'),
-        help='Path to evaluation_dataset.csv (needs question + context_recall).',
+        default=str(_PROJECT_ROOT / 'data' / 'evaluation_report.csv'),
+        help='Path to evaluation_report.csv (needs question/user_input + context_recall).',
     )
     parser.add_argument(
         '--dense-index',

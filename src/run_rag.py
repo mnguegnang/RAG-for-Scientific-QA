@@ -54,7 +54,7 @@ class ScientificRAGPipeline:
     # A best-document logit below this value means no retrieved document
     # is likely relevant — generation is suppressed to avoid hallucination.
     # Tune empirically via: python -m src.evaluation.calibrate_crag
-    CRAG_THRESHOLD: float = 0.0
+    CRAG_THRESHOLD: float = -2#0.0
 
     # HyDE word-count threshold (Gao et al., 2022 — arXiv:2212.10496).
     # Queries shorter than this are considered "vague" and benefit from
@@ -77,7 +77,7 @@ class ScientificRAGPipeline:
         """
         return self.generator.generate_hypothetical_answer(query)
 
-    def ask(self, query: str) -> dict:
+    def ask(self, query: str, filter_paper_id: str = None) -> dict:
         """
         Executes the full RAG pipeline for a given query.
 
@@ -114,7 +114,7 @@ class ScientificRAGPipeline:
                 )
                 dense_query = None
         logging.info("Stage 1: Fetching top 50 candidates via Hybrid Search (Dense + Sparse)...")
-        broad_results = self.retriever.search(query, k=50, dense_query=dense_query)
+        broad_results = self.retriever.search(query, k=50, dense_query=dense_query, filter_paper_id=filter_paper_id)
 
         if not broad_results:
             return {"answer": "Error: No documents found in the database.", "retrieved_docs": [],
@@ -131,7 +131,8 @@ class ScientificRAGPipeline:
         # threshold, the retrieved context is too noisy for reliable generation.
         best_score = max(d.get("rerank_score", 0.0) for d in top_7_docs)
         logging.info(f"CRAG check — best rerank logit: {best_score:.4f} (threshold: {self.CRAG_THRESHOLD})")
-
+        # umcomment the following later after calibrating the CRAG threshold empirically on some sample queries. 
+        #For now, we want to see the full pipeline in action without the CRAG gate suppressing generation.
         if best_score < self.CRAG_THRESHOLD:
             logging.warning("CRAG gate triggered: retrieved context below relevance threshold.")
             return {

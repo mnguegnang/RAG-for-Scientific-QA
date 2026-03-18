@@ -66,14 +66,13 @@ class ALCE_RAGASevaluator:
         Output nothing else.
         """
         try:
-            # FIX: Handle different input/output formats between Ollama and HuggingFace
-            if isinstance(self.llm, ChatOllama):
-                response = self.llm.invoke([HumanMessage(content=prompt)])
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            # All LangChain chat models (ChatOpenAI, ChatOllama, etc.) return
+            # a BaseMessage; extract the text content before calling .upper()
+            if hasattr(response, "content"):
                 answer_text = response.content
             else:
-                # HuggingFace pipeline takes string and returns string
-                answer_text = self.llm.invoke(prompt)
-                
+                answer_text = str(response)
             return "TRUE" in answer_text.upper()
         except Exception as e:
             logging.error(f"Local LLM Entailment check failed: {e}")
@@ -89,7 +88,7 @@ class ALCE_RAGASevaluator:
         sentences_with_citations = 0
 
         for sentence in sentences:
-            citations = re.findall(r'$$Doc (\d+)$$', sentence)
+            citations = re.findall(r'\[Doc (\d+)\]', sentence)
             
             if citations:
                 sentences_with_citations += 1
@@ -128,8 +127,10 @@ def get_hardware_aware_models():
         
         # 2. Use modern Ragas llm_factory
         ragas_llm = llm_factory(
-            model="meta-llama/Llama-3.1-8B-Instruct", 
-            client=local_client
+            model="meta-llama/Llama-3.1-8B-Instruct",
+            client=local_client,
+            max_tokens=512,   # Cap judge output; without this vLLM generates indefinitely
+            temperature=0.0,
         )
         
         # 3. Provide the LangChain equivalent for your ALCE NLI checks
@@ -137,7 +138,8 @@ def get_hardware_aware_models():
             model="meta-llama/Llama-3.1-8B-Instruct",
             base_url=f"http://localhost:{VLLM_PORT}/v1",
             api_key="EMPTY",
-            temperature=0.0
+            temperature=0.0,
+            max_tokens=8,     # ALCE only needs TRUE/FALSE — cap to prevent runaway generation
         )
         
         # 4. Use RAGAS native HuggingFace embeddings
@@ -146,6 +148,8 @@ def get_hardware_aware_models():
             device="cuda",
             trust_remote_code=True,
             normalize_embeddings=True,
+            prompts={"query": "search_query: ", "document": "search_document: "},  # nomic-embed-text-v1.5 task prefixes
+            default_prompt_name="query",
         )
 
     else:
@@ -157,8 +161,8 @@ def get_hardware_aware_models():
             api_key="ollama"
         )
         
-        ragas_llm = llm_factory(model="llama3", client=ollama_client)
-        local_judge_llm = ChatOllama(model="llama3", temperature=0.0)
+        ragas_llm = llm_factory(model="llama3", client=ollama_client, max_tokens=512, temperature=0.0)
+        local_judge_llm = ChatOllama(model="llama3", temperature=0.0, num_predict=8)
         
         # CPU Fallback uses RAGAS native HuggingFace embeddings
         ragas_embeddings = RagasHuggingFaceEmbeddings(
@@ -166,6 +170,8 @@ def get_hardware_aware_models():
             device="cpu",
             trust_remote_code=True,
             normalize_embeddings=True,
+            prompts={"query": "search_query: ", "document": "search_document: "},  # nomic-embed-text-v1.5 task prefixes
+            default_prompt_name="query",
         )
         
     return local_judge_llm, ragas_llm, ragas_embeddings, is_gpu
@@ -212,7 +218,7 @@ def run_evaluation(input_csv: str = None, output_csv: str = None):
     # 2. DYNAMIC HARDWARE CONFIGURATION
     if is_gpu:
         eval_batch_size = 16
-        max_workers = 16
+        max_workers = 4    # Reduced from 16: fewer concurrent calls prevents vLLM timeout cascade
         timeout = 600      # 10 minutes max (GPUs are fast)
     else:
         eval_batch_size = 1
@@ -220,10 +226,10 @@ def run_evaluation(input_csv: str = None, output_csv: str = None):
         timeout = 2400     # 40 minutes max (CPUs are slow)
 
     run_config = RunConfig(
-        timeout=timeout,    
-        max_retries=2,   
-        max_wait=30,     
-        max_workers=max_workers,   
+        timeout=timeout,
+        max_retries=3,     # Retry failed judge calls before marking row as NaN
+        max_wait=60,
+        max_workers=max_workers,
     )
 
     logging.info(f"Starting Local RAGAS Evaluation (GPU Mode: {is_gpu})...")

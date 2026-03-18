@@ -86,8 +86,9 @@ def fetch_qasper_sample(num_samples: int = 10) -> List[Dict]:
             for ans in ans_list:
                 if ans['free_form_answer']:
                     qa_pairs.append({
-                        "question": q,
-                        "ground_truth": ans['free_form_answer']
+                        "question":     q,
+                        "ground_truth": ans['free_form_answer'],
+                        "paper_id":     row["id"],  # QASPER paper ID — used to scope retrieval
                     })
                     break # Stop if we found a valid answer for this question
         
@@ -125,8 +126,8 @@ def generate_evaluation_dataset(output_path: str = None):
         generator_backend=generator_backend,
     )
     
-    # 2. Get the evaluation questions currently limited to 20 for quick testing but will be increase in production
-    qa_pairs = fetch_qasper_sample()#num_samples=20
+    # 2. Get the evaluation questions use 250 for sample testing 
+    qa_pairs = fetch_qasper_sample(200)#num_samples=250
     
     results = []
     logging.info(f"Generating RAG answers for {len(qa_pairs)} questions...")
@@ -136,7 +137,7 @@ def generate_evaluation_dataset(output_path: str = None):
         
         
         # The pipeline's ask() returns {"answer": <full LLM output>, "retrieved_docs": [...]}
-        pipeline_output = rag_pipeline.ask(qa["question"])
+        pipeline_output = rag_pipeline.ask(qa["question"], filter_paper_id=qa.get("paper_id"))
         full_answer = pipeline_output["answer"]
         retrieved_docs = pipeline_output["retrieved_docs"]
 

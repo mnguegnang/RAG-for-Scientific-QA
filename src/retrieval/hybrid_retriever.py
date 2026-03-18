@@ -98,7 +98,7 @@ class HybridRetriever:
         return results
 
     def search(self, query: str, k: int = 10, rrf_k: int = 60,
-               dense_query: str = None):
+               dense_query: str = None, filter_paper_id: str = None):
         """
         Performs Hybrid Search using RRF.
 
@@ -110,8 +110,18 @@ class HybridRetriever:
             BM25 sparse search always uses the original *query*.
         """
         # 1. Get Independent Results
-        dense_res = self._search_dense(query, k, dense_query=dense_query)
-        sparse_res = self._search_sparse(query, k)
+        # Fetch more candidates when paper-scoped filtering is active so that
+        # after the paper_id post-filter we still return up to k results.
+        # Dasigi et al. (2021 NAACL) — QASPER questions are anchored to one paper;
+        # cross-paper retrieval always produces ALCE=0 because cited evidence
+        # never entails the ground truth from a different paper.
+        broad_k = k * 4 if filter_paper_id else k
+        dense_res = self._search_dense(query, broad_k, dense_query=dense_query)
+        sparse_res = self._search_sparse(query, broad_k)
+
+        if filter_paper_id:
+            dense_res  = [r for r in dense_res  if r.get("doc_id") == filter_paper_id][:k]
+            sparse_res = [r for r in sparse_res if r.get("doc_id") == filter_paper_id][:k]
         
         # 2. Apply RRF
         # Map unique text/ID to accumulated score
