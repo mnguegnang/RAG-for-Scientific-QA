@@ -1,0 +1,38 @@
+========================================
+Job ID    : 27963
+Node      : cc-gpu02-n01
+Start     : 01:13:30
+========================================
+0, NVIDIA A100-SXM4-80GB, 81920 MiB, 81156 MiB
+1, NVIDIA A100-SXM4-80GB, 81920 MiB, 81156 MiB
+2, NVIDIA A100-SXM4-80GB, 81920 MiB, 81156 MiB
+PyTorch : 2.10.0+cu128
+CUDA    : True
+GPUs    : 3
+--- Starting pipeline_ingest.py at 01:14:42 ---
+=== Data Ingestion & Indexing ===
+Loading QASPER dataset from HuggingFace...
+Loaded 888 papers.
+
+--- Sample Schema ---
+ID: 1909.00694
+Title: Minimally Supervised Learning of Affective Events Using Discourse Relations
+Section Keys: ['Introduction', 'Related Work', 'Proposed Method']...
+Processing subset of 888 papers.
+
+--- Chunking ---
+Result: Generated 47810 chunks.
+
+--- Dense Indexing (FAISS) ---
+Generating embeddings for 47810 chunks...
+Dense Index built with 47810 vectors.
+Saved dense index to ../data/indices/dense.index
+
+--- Sparse Indexing (BM25) ---
+Tokenizing corpus for BM25...
+BM25 Index built.
+Saved sparse index to ../data/indices/sparse.pkl
+
+=== Ingestion Complete ===
+Files created in data/indices/:
+--- Finished at 01:18:04 with exit code 1 ---

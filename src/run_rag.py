@@ -53,8 +53,29 @@ class ScientificRAGPipeline:
     # bge-reranker-base outputs raw logits; sigmoid(0.0) = 0.5.
     # A best-document logit below this value means no retrieved document
     # is likely relevant — generation is suppressed to avoid hallucination.
-    # Tune empirically: raise towards 1.0 to be stricter, lower to be more permissive.
+    # Tune empirically via: python -m src.evaluation.calibrate_crag
     CRAG_THRESHOLD: float = 0.0
+
+    # HyDE word-count threshold (Gao et al., 2022 — arXiv:2212.10496).
+    # Queries shorter than this are considered "vague" and benefit from
+    # generating a hypothetical answer before encoding for dense search.
+    # Examples of short queries: "What are the results?" (4 words),
+    #                             "How big is the Japanese data?" (7 words).
+    HYDE_QUERY_WORD_THRESHOLD: int = 10
+
+    def _generate_hyde_query(self, query: str) -> str:
+        """
+        Generates a hypothetical passage (HyDE) for dense retrieval.
+
+        Short queries produce weak embedding signals because SPECTER2 was
+        pre-trained on passage-level text, not question-style strings.
+        Encoding a hypothetical answer passage instead closes this gap.
+
+        Reference:
+            Gao et al. (2022). Precise Zero-Shot Dense Retrieval without
+            Relevance Labels (HyDE). arXiv:2212.10496. ACL 2023.
+        """
+        return self.generator.generate_hypothetical_answer(query)
 
     def ask(self, query: str) -> dict:
         """
@@ -70,8 +91,30 @@ class ScientificRAGPipeline:
         logging.info(f"Processing Query: '{query}'")
 
         # 1. RETRIEVE (Recall)
+        # HyDE (Gao et al., 2022): for short/vague queries, generate a
+        # hypothetical answer and encode *that* for dense search.
+        # BM25 always uses the original query for exact keyword matching.
+        dense_query = None
+        query_word_count = len(query.split())
+        if query_word_count < self.HYDE_QUERY_WORD_THRESHOLD:
+            logging.info(
+                "Stage 1a: Short query (%d words < threshold %d) — running HyDE...",
+                query_word_count, self.HYDE_QUERY_WORD_THRESHOLD,
+            )
+            try:
+                dense_query = self._generate_hyde_query(query)
+                logging.info(
+                    "HyDE passage generated (%d chars): %.80s...",
+                    len(dense_query), dense_query,
+                )
+            except Exception as hyde_err:
+                logging.warning(
+                    "HyDE generation failed (%s); falling back to raw query.",
+                    hyde_err,
+                )
+                dense_query = None
         logging.info("Stage 1: Fetching top 50 candidates via Hybrid Search (Dense + Sparse)...")
-        broad_results = self.retriever.search(query, k=50)
+        broad_results = self.retriever.search(query, k=50, dense_query=dense_query)
 
         if not broad_results:
             return {"answer": "Error: No documents found in the database.", "retrieved_docs": [],

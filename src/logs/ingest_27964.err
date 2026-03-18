@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/home/math/nguegnang/miniconda3/envs/qasper-rag/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/math/nguegnang/miniconda3/envs/qasper-rag/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/math/nguegnang/qasper-rag-scientific-qa/src/pipeline_ingest.py", line 2, in <module>
+    from data.make_dataset import load_and_inspect_qasper
+ModuleNotFoundError: No module named 'data'

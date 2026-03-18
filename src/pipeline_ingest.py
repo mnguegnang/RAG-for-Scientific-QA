@@ -1,5 +1,11 @@
 import os
+from pathlib import Path
 from src.data.make_dataset import load_and_inspect_qasper
+
+# Absolute path to project root — works whether this script is run as
+# "python pipeline_ingest.py" from src/ or "python -m src.pipeline_ingest"
+# from the project root.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 from src.retrieval.chunking import QasperChunker
 from src.retrieval.vector_store import DenseIndexer
 from src.retrieval.sparse_store import SparseIndexer
@@ -37,8 +43,9 @@ def run_ingestion_pipeline():
     sparse_idx.save()
 
     print("\n=== Ingestion Complete ===")
-    print("Files created in data/indices/:")
-    print(os.listdir("data/indices/"))
+    indices_dir = _PROJECT_ROOT / "data" / "indices"
+    print(f"Files created in {indices_dir}:")
+    print(os.listdir(str(indices_dir)))
 
 if __name__ == "__main__":
     run_ingestion_pipeline()

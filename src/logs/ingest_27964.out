@@ -1,0 +1,19 @@
+========================================
+Job ID    : 27964
+Node      : cc-gpu02-n01
+Start     : 02:32:14
+========================================
+0, NVIDIA A100-SXM4-80GB, 81920 MiB, 81156 MiB
+1, NVIDIA A100-SXM4-80GB, 81920 MiB, 81156 MiB
+2, NVIDIA A100-SXM4-80GB, 81920 MiB, 81156 MiB
+CUDA_VISIBLE_DEVICES : 0,1,2
+Visible GPUs for DataParallel: 3
+  GPU 0: NVIDIA A100-SXM4-80GB
+  GPU 1: NVIDIA A100-SXM4-80GB
+  GPU 2: NVIDIA A100-SXM4-80GB
+PyTorch : 2.10.0+cu128
+CUDA    : True
+GPUs    : 3
+Working directory: /var/spool/slurmd
+--- Starting pipeline_ingest at 02:33:08 ---
+--- Finished at 02:33:08 with exit code 1 ---

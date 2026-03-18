@@ -105,12 +105,24 @@ def generate_evaluation_dataset(output_path: str = None):
     if output_path is None:
         output_path = str(_project_root / "data" / "evaluation_dataset.csv")
 
-    # 1. Initialize the Orchestrator (loads FAISS, Cross-Encoder, Ollama)
-    logging.info("Initializing Scientific RAG Pipeline...")
+    # 1. Initialize the Orchestrator (loads FAISS, Cross-Encoder, and the
+    #    configured LLM backend).
+    #
+    #    When GENERATOR_BACKEND=vllm is set in the environment (e.g. from
+    #    run_evaluation.sh), the pipeline routes generation requests to the
+    #    already-running vLLM server instead of loading the weights here.
+    #    This frees GPU memory on this process for SPECTER2 and the reranker.
+    import os
+    generator_backend = os.environ.get("GENERATOR_BACKEND", "auto")
+    logging.info(
+        "Initializing Scientific RAG Pipeline (generator_backend=%s)...",
+        generator_backend,
+    )
     rag_pipeline = ScientificRAGPipeline(
         dense_index_path="data/indices/dense.index",
         dense_meta_path="data/indices/dense.index.meta",
         sparse_index_path="data/indices/sparse.pkl",
+        generator_backend=generator_backend,
     )
     
     # 2. Get the evaluation questions currently limited to 20 for quick testing but will be increase in production

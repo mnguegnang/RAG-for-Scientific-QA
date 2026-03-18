@@ -1,3 +1,4 @@
+import os
 import requests
 import logging
 import json
@@ -42,7 +43,16 @@ class LocalLLMGenerator:
     ):
         # ── Resolve backend ──────────────────────────────────────────────────
         if backend == "auto":
-            backend = "transformers" if torch.cuda.is_available() else "ollama"
+            # GENERATOR_BACKEND env var lets the SLURM script request the
+            # vllm backend (pointing to an already-running vLLM server)
+            # without changing Python code.  Falls back to original heuristic.
+            env_backend = os.environ.get("GENERATOR_BACKEND", "").strip().lower()
+            if env_backend in {"vllm", "ollama", "transformers"}:
+                backend = env_backend
+            elif torch.cuda.is_available():
+                backend = "transformers"
+            else:
+                backend = "ollama"
             logging.info("[LLMGenerator] backend=auto resolved to: %s", backend)
 
         self.backend = backend
@@ -57,8 +67,22 @@ class LocalLLMGenerator:
             self.model_name = hf_model
             self._load_hf_pipeline()
 
+        elif self.backend == "vllm":
+            # Route generation to a pre-running vLLM server that exposes an
+            # OpenAI-compatible API.  No local weights are loaded in this
+            # process, freeing GPU memory for SPECTER2 and the reranker.
+            self.model_name = hf_model
+            self.vllm_url = os.environ.get("VLLM_API_URL", "http://localhost:8000/v1")
+            logging.info(
+                "[LLMGenerator] Using vLLM backend | url: %s | model: %s",
+                self.vllm_url, self.model_name,
+            )
+
         else:
-            raise ValueError(f"Unknown backend '{backend}'. Choose 'auto', 'ollama', or 'transformers'.")
+            raise ValueError(
+                f"Unknown backend '{backend}'. "
+                "Choose 'auto', 'ollama', 'transformers', or 'vllm'."
+            )
 
     # ── HuggingFace pipeline loader ───────────────────────────────────────────
     def _load_hf_pipeline(self):
@@ -146,6 +170,8 @@ class LocalLLMGenerator:
 
         if self.backend == "ollama":
             return self._generate_ollama(full_prompt)
+        elif self.backend == "vllm":
+            return self._generate_vllm(full_prompt)
         else:
             return self._generate_transformers(full_prompt)
 
@@ -199,6 +225,34 @@ class LocalLLMGenerator:
             logging.error("[Ollama] Connection failed: %s", e)
             return f"System Error: Could not connect to Ollama at {self.api_url}. Is 'ollama serve' running?"
 
+    # ── vLLM backend (OpenAI-compatible server) ──────────────────────────────────
+    def _generate_vllm(self, full_prompt: str) -> str:
+        """Calls a vLLM server's OpenAI-compatible chat-completions endpoint."""
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "The 'openai' package is required for the vllm backend. "
+                "Install it with: pip install openai"
+            ) from exc
+
+        logging.info(
+            "[vLLM] Sending prompt to %s | model=%s",
+            self.vllm_url, self.model_name,
+        )
+        client = OpenAI(base_url=self.vllm_url, api_key="EMPTY")
+        resp = client.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": full_prompt}],
+            max_tokens=1024,
+            temperature=0.1,
+        )
+        answer = resp.choices[0].message.content or ""
+        print("\n" + "="*40 + " LLM OUTPUT (vLLM) " + "="*40 + "\n")
+        print(answer)
+        print("\n" + "="*92 + "\n")
+        return answer
+
     # ── HuggingFace transformers backend ──────────────────────────────────────
     def _generate_transformers(self, full_prompt: str) -> str:
         """Generates answer using HuggingFace pipeline directly on GPU."""
@@ -219,3 +273,67 @@ class LocalLLMGenerator:
         print(answer)
         print("\n" + "="*92 + "\n")
         return answer
+
+    # ── HyDE: Hypothetical Document Embedding ──────────────────────────────────
+    def generate_hypothetical_answer(self, query: str) -> str:
+        """
+        Generates a brief hypothetical passage for HyDE dense retrieval.
+
+        Asks the LLM to write a concise 2-3 sentence factual passage that
+        would directly answer *query*, as if extracted from a scientific paper.
+        This passage is then encoded by SPECTER2 in place of the raw query,
+        closing the query-document semantic gap.
+
+        Reference:
+            Gao et al. (2022). Precise Zero-Shot Dense Retrieval without
+            Relevance Labels (HyDE). arXiv:2212.10496. ACL 2023.
+            — Encoding a hypothetical passage improves nDCG@10 by 5-15 points
+              on academic benchmarks vs. encoding the raw question.
+        """
+        hyde_prompt = (
+            "You are a scientific assistant. Write a concise 2-3 sentence "
+            "factual passage that would directly answer the following question, "
+            "as if it were extracted verbatim from a scientific paper. "
+            "State facts directly without hedging.\n\n"
+            f"Question: {query}\n\n"
+            "Hypothetical passage:"
+        )
+        if self.backend == "ollama":
+            payload = {
+                "model": self.model_name,
+                "prompt": hyde_prompt,
+                "stream": False,
+                "options": {"temperature": 0.3, "num_predict": 200},
+            }
+            try:
+                resp = requests.post(self.api_url, json=payload, timeout=60)
+                resp.raise_for_status()
+                return resp.json().get("response", "").strip() or query
+            except Exception as exc:
+                logging.warning("[HyDE/Ollama] generation failed: %s", exc)
+                return query  # fallback: use original query
+        elif self.backend == "vllm":
+            try:
+                from openai import OpenAI
+                client = OpenAI(base_url=self.vllm_url, api_key="EMPTY")
+                resp = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": hyde_prompt}],
+                    max_tokens=200,
+                    temperature=0.3,
+                )
+                text = (resp.choices[0].message.content or "").strip()
+                return text if text else query
+            except Exception as exc:
+                logging.warning("[HyDE/vLLM] generation failed: %s", exc)
+                return query
+        else:
+            outputs = self.pipe(
+                hyde_prompt,
+                max_new_tokens=200,
+                do_sample=True,
+                temperature=0.3,
+                return_full_text=False,
+            )
+            text = outputs[0]["generated_text"].strip()
+            return text if text else query
