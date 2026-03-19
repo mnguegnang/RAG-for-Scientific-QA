@@ -54,7 +54,7 @@ class ScientificRAGPipeline:
     # A best-document logit below this value means no retrieved document
     # is likely relevant — generation is suppressed to avoid hallucination.
     # Tune empirically via: python -m src.evaluation.calibrate_crag
-    CRAG_THRESHOLD: float = -2#0.0
+    CRAG_THRESHOLD: float = 0.517#-2#0.0
 
     # HyDE word-count threshold (Gao et al., 2022 — arXiv:2212.10496).
     # Queries shorter than this are considered "vague" and benefit from

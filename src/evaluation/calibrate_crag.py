@@ -1,29 +1,42 @@
 """
 CRAG Threshold Calibration
 --------------------------
-Runs retrieval + reranking on the evaluation set to record each query's
-maximum reranker logit, then plots logit distributions for relevant vs.
-irrelevant retrievals and identifies the F1-maximising threshold.
+Two calibration modes for the bge-reranker-v2-m3 CRAG gate in run_rag.py.
+
+Mode 1 — "f1"  (default, when context_recall is available):
+    Runs retrieval + reranking on the evaluation set, records each query’s
+    maximum reranker logit, plots distributions for relevant vs. irrelevant
+    retrievals, and finds the F1-maximising threshold.
+    Requires evaluation_report.csv with a non-NaN context_recall column.
+
+    Reference:
+        Yan et al. (2024). CRAG: Corrective Retrieval Augmented Generation.
+        arXiv:2401.15884. §3.3: "We calibrate the retrieval evaluator threshold
+        empirically on the score distribution of training samples to maximise
+        retrieval F1."
+
+Mode 2 — "percentile" (fallback when context_recall is all-NaN):
+    Reads best_rerank_score directly from evaluation_dataset.csv (written by
+    generate_predictions.py) and sets the threshold at the P-th percentile
+    of the observed distribution.  No RAGAS metrics required.
+
+    Rationale (Karpukhin et al. 2020, DPR §5.4; Asai et al. 2023, Self-RAG §3.2):
+        A score at the 10th percentile separates the bottom 10% of retrievals
+        (where even the scoped paper has no relevant passage) from the majority,
+        without discarding valid queries.  With paper-ID filtering already in
+        place the distribution is expected to be right-skewed, so P=10 is apt.
 
 Usage (from project root):
+    # Mode 1 — F1-max calibration (needs context_recall):
     python -m src.evaluation.calibrate_crag
-    python -m src.evaluation.calibrate_crag --eval-csv data/evaluation_report.csv
+
+    # Mode 2 — percentile calibration (needs best_rerank_score):
+    python -m src.evaluation.calibrate_crag --mode percentile
+    python -m src.evaluation.calibrate_crag --mode percentile --percentile 5
 
 Output:
-    • Console table: per-query max reranker logit vs. context_recall label
-    • Console: recommended threshold value
+    • Console: per-query table + recommended CRAG_THRESHOLD value
     • Plot saved to reports/figures/crag_calibration.png
-
-How "relevance" is defined:
-    context_recall > 0  →  label = 1 (retrieval found useful evidence)
-    context_recall = 0  →  label = 0 (retrieval missed the gold evidence)
-    context_recall = NaN→  excluded from calibration
-
-Reference:
-    Yan et al. (2024). CRAG: Corrective Retrieval Augmented Generation.
-    arXiv:2401.15884. §3.3 Knowledge Refinement:
-        "We calibrate the retrieval evaluator threshold empirically on the
-         score distribution of training samples to maximise retrieval F1."
 """
 
 import argparse
@@ -252,6 +265,89 @@ def calibrate(eval_csv: str, dense_index: str, dense_meta: str,
     return best_thresh
 
 
+# ── Percentile calibration (Mode 2 — no RAGAS labels needed) ────────────────
+
+def calibrate_percentile(dataset_csv: str, percentile: float,
+                         output_plot: str) -> float:
+    """
+    Derive a CRAG threshold from the empirical distribution of
+    best_rerank_score values saved by generate_predictions.py.
+
+    Sets threshold at the `percentile`-th percentile (default 10), following
+    Karpukhin et al. (2020) DPR §5.4 and Asai et al. (2023) Self-RAG §3.2:
+    retain the top (100-P)% of retrievals, suppress only the lowest P%.
+    With paper-ID filtering the distribution is right-skewed, so P=10 is
+    a conservative but principled starting point.
+    """
+    df = pd.read_csv(dataset_csv)
+
+    if "best_rerank_score" not in df.columns:
+        raise ValueError(
+            f"{dataset_csv} has no 'best_rerank_score' column. "
+            "Re-run generate_predictions.py to regenerate the dataset "
+            "(the column is saved from run_rag.py's pipeline output)."
+        )
+
+    scores = pd.to_numeric(df["best_rerank_score"], errors="coerce").dropna()
+
+    # Remove -inf sentinel values (used when retrieval returned no documents)
+    n_sentinel = int((np.isinf(scores) & (scores < 0)).sum())
+    scores = scores[np.isfinite(scores)]
+    if n_sentinel > 0:
+        logging.warning(
+            "%d rows had best_rerank_score=-inf (empty retrieval) "
+            "— excluded from calibration.",
+            n_sentinel,
+        )
+
+    if len(scores) == 0:
+        raise ValueError(
+            "No finite best_rerank_score values found — all queries returned "
+            "empty retrieval results."
+        )
+
+    threshold = float(np.percentile(scores, percentile))
+    suppressed = int((scores < threshold).sum())
+    pct_supp = 100.0 * suppressed / len(scores)
+
+    print(f"\n── Score-distribution calibration (percentile={percentile}) ────")
+    print(f"  Samples          : {len(scores)}  (excluded {n_sentinel} empty-retrieval rows)")
+    print(f"  Min / Mean / Max : {scores.min():.4f} / {scores.mean():.4f} / {scores.max():.4f}")
+    print(f"  {percentile}th percentile → threshold = {threshold:.4f}")
+    print(f"  Queries suppressed by CRAG gate: {suppressed}/{len(scores)} ({pct_supp:.1f}%)")
+    print()
+    print(f"  → To apply: edit CRAG_THRESHOLD in src/run_rag.py:")
+    print(f"      CRAG_THRESHOLD: float = {threshold:.4f}")
+    print(f"    or pass --crag-threshold {threshold:.4f} at the CLI.")
+    print()
+    print("  After the next evaluation run (with context_recall available),")
+    print("  re-run with --mode f1 for a tighter F1-maximising threshold.")
+
+    try:
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.hist(scores, bins=30, color="steelblue", alpha=0.8,
+                label=f"best_rerank_score (n={len(scores)})")
+        ax.axvline(threshold, color="black", linestyle="--", linewidth=2,
+                   label=f"{percentile}th pct threshold = {threshold:.3f}")
+        ax.axvline(0.0, color="grey", linestyle=":", linewidth=1,
+                   label="Default threshold (0.0)")
+        ax.set_xlabel("Max Reranker Logit (bge-reranker-v2-m3)")
+        ax.set_ylabel("Count")
+        ax.set_title("CRAG Threshold — Score Distribution (percentile mode)")
+        ax.legend()
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(os.path.abspath(output_plot)), exist_ok=True)
+        plt.savefig(output_plot, dpi=150, bbox_inches="tight")
+        logging.info("Plot saved → %s", output_plot)
+        plt.close()
+    except ImportError:
+        logging.warning("matplotlib not installed — skipping plot.")
+
+    return threshold
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -259,9 +355,28 @@ def main() -> None:
         description="Calibrate the CRAG threshold from the evaluation dataset."
     )
     parser.add_argument(
+        '--mode',
+        choices=['f1', 'percentile'],
+        default='f1',
+        help='"f1": F1-maximising threshold (needs evaluation_report.csv with context_recall). '
+             '"percentile": percentile-cut from best_rerank_score (needs evaluation_dataset.csv). '
+             'Use "percentile" when context_recall is all-NaN.',
+    )
+    parser.add_argument(
         '--eval-csv',
         default=str(_PROJECT_ROOT / 'data' / 'evaluation_report.csv'),
-        help='Path to evaluation_report.csv (needs question/user_input + context_recall).',
+        help='Path to evaluation_report.csv (needs context_recall). Used by --mode f1.',
+    )
+    parser.add_argument(
+        '--dataset-csv',
+        default=str(_PROJECT_ROOT / 'data' / 'evaluation_dataset.csv'),
+        help='Path to evaluation_dataset.csv with best_rerank_score. Used by --mode percentile.',
+    )
+    parser.add_argument(
+        '--percentile',
+        type=float,
+        default=10.0,
+        help='Percentile cutoff for --mode percentile (default 10). Suppresses bottom P%% of retrievals.',
     )
     parser.add_argument(
         '--dense-index',
@@ -282,13 +397,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    calibrate(
-        eval_csv=args.eval_csv,
-        dense_index=args.dense_index,
-        dense_meta=args.dense_meta,
-        sparse_index=args.sparse_index,
-        output_plot=args.output_plot,
-    )
+    if args.mode == 'percentile':
+        calibrate_percentile(
+            dataset_csv=args.dataset_csv,
+            percentile=args.percentile,
+            output_plot=args.output_plot,
+        )
+    else:
+        calibrate(
+            eval_csv=args.eval_csv,
+            dense_index=args.dense_index,
+            dense_meta=args.dense_meta,
+            sparse_index=args.sparse_index,
+            output_plot=args.output_plot,
+        )
 
 
 if __name__ == '__main__':

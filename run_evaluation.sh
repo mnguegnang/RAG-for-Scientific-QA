@@ -2,7 +2,7 @@
 #SBATCH --job-name=rag_eval
 #SBATCH --output=logs/eval_%j.log
 #SBATCH --error=logs/eval_error_%j.log
-#SBATCH --gres=gpu:3
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=40G
 #SBATCH --time=07:00:00
@@ -60,11 +60,25 @@ check_hf_access() {
     local model_id="$1"
     local url="https://huggingface.co/${model_id}/resolve/main/config.json"
     local http_code
-    http_code=$(curl -sf -o /dev/null -w "%{http_code}"         -H "Authorization: Bearer ${HF_TOKEN}" "${url}" 2>/dev/null || echo "000")
+    # NOTE: do NOT use -f here.  curl -f exits non-zero on HTTP 4xx, which
+    # triggers the "|| echo 000" fallback — but %{http_code} has already been
+    # written to stdout, so both get concatenated (e.g. "401" + "000" = "401000").
+    # Using -s only keeps stderr silent while still capturing the real status code.
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Authorization: Bearer ${HF_TOKEN}" "${url}" 2>/dev/null)
+    # Empty output means curl itself failed (network unreachable, DNS error, etc.)
+    [ -z "${http_code}" ] && http_code="000"
     if [ "${http_code}" != "200" ]; then
         echo "ERROR: HuggingFace token does not have access to '${model_id}'."
         echo "       HTTP status: ${http_code}"
-        echo "       Request access at https://huggingface.co/${model_id}"
+        if [ "${http_code}" = "401" ]; then
+            echo "       Token is missing or expired — please refresh your HF_TOKEN."
+        elif [ "${http_code}" = "403" ]; then
+            echo "       Token is valid but lacks model permission."
+            echo "       Request access at https://huggingface.co/${model_id}"
+        elif [ "${http_code}" = "000" ]; then
+            echo "       Could not reach huggingface.co — check network/proxy settings."
+        fi
         exit 1
     fi
     echo "HuggingFace access confirmed for '${model_id}' (HTTP ${http_code})"
@@ -120,6 +134,7 @@ if [ "${N_GPU}" -ge 2 ]; then
     VLLM_GPUS=$(IFS=,; echo "${_GPUS[*]:0:$((N_ALLOC - 1))}")
     TP_SIZE=$((N_ALLOC - 1))
     USE_GPU=true
+    VLLM_MEM_UTIL="0.85"  # dedicated vLLM GPUs — full utilisation is safe
     echo "GPU layout  : vLLM on [${VLLM_GPUS}] (tensor-parallel-size=${TP_SIZE})"
     echo "              RAG/Eval on [${RAG_GPU}]"
     GENERATOR_BACKEND_VALUE=vllm
@@ -131,6 +146,7 @@ elif [ "${N_GPU}" -eq 1 ]; then
     VLLM_GPUS="${RAG_GPU}"
     TP_SIZE=1
     USE_GPU=true
+    VLLM_MEM_UTIL="0.50"  # shared GPU — keep 50% VRAM for SPECTER2/BGE/Nomic
     echo "GPU layout  : single GPU [${RAG_GPU}] for vLLM + RAG/Eval"
     GENERATOR_BACKEND_VALUE=vllm
 
@@ -158,7 +174,8 @@ if [ "${USE_GPU}" = true ]; then
         --dtype auto \
         --port 8000 \
         --tensor-parallel-size "${TP_SIZE}" \
-        --gpu-memory-utilization 0.85 \
+        --gpu-memory-utilization "${VLLM_MEM_UTIL}" \
+        --max-model-len 8192 \
         --disable-custom-all-reduce \
         --hf-token "${HF_TOKEN}" &
     VLLM_PID=$!

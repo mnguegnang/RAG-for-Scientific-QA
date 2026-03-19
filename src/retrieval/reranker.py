@@ -20,7 +20,7 @@ class Reranker:
         
         # Optimization: Use mixed precision (FP16) on GPU to handle the larger 
         # 568M parameter model efficiently, preventing Out-Of-Memory errors.
-        model_kwargs = {"torch_dtype": torch.float16} if device == "cuda" else {}
+        model_kwargs = {"dtype": torch.float16} if device == "cuda" else {}
         
         # We explicitly set max_length=1024. 
         # Since our dense retrieval chunks are capped at 500 tokens (Specter2 limit),

@@ -18,9 +18,11 @@ from ragas.metrics._context_precision import ContextPrecision
 from ragas.metrics._context_recall import ContextRecall
 from ragas.metrics._faithfulness import Faithfulness
 from ragas.metrics._answer_relevance import AnswerRelevancy
-from ragas.embeddings import HuggingFaceEmbeddings as RagasHuggingFaceEmbeddings
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from langchain_huggingface import HuggingFaceEmbeddings as LCHuggingFaceEmbeddings
 from ragas.llms import llm_factory
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
+import httpx
 
 # LangChain Imports
 from langchain_openai import ChatOpenAI
@@ -119,17 +121,44 @@ def get_hardware_aware_models():
         logging.info(f"GPU Detected! Connecting to local vLLM server on port {VLLM_PORT}...")
         is_gpu = True
         
-        # 1. Create an OpenAI client pointing to your local vLLM server
-        local_client = OpenAI(
-            base_url=f"http://localhost:{VLLM_PORT}/v1",
-            api_key="EMPTY"  # vLLM does not require an API key
+        # 1. Async client for RAGAS (llm_factory uses async internally).
+        # Using a sync OpenAI client inside RAGAS's asyncio eval loop
+        # exhausts the connection pool and raises "Connection error" on all
+        # 804 judge calls.  AsyncOpenAI is the correct client type here.
+        # Reference: RAGAS docs — https://docs.ragas.io/en/latest/
+        # Explicit httpx connection limits prevent pool exhaustion when
+        # RAGAS fires many concurrent sub-calls (statement extraction,
+        # NLI checks, question generation).  Without limits the default
+        # pool of 100 connections fills up → "Connection error" on all
+        # remaining requests.
+        # keepalive_expiry must stay strictly below the vLLM/Uvicorn
+        # server-side keep-alive idle timeout.  Uvicorn's hard default is 5 s;
+        # setting keepalive_expiry=4.0 ensures httpx evicts idle connections
+        # 1 s before the server closes the socket, preventing stale-connection
+        # RemoteProtocolError.  (The --timeout-keep-alive CLI flag was removed
+        # in the installed vLLM version, so the default cannot be overridden.)
+        _http_client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                max_connections=10,
+                keepalive_expiry=4.0,  # 1 s margin below Uvicorn default 5 s
+            ),
+            timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=60.0),
         )
-        
-        # 2. Use modern Ragas llm_factory
+        async_client = AsyncOpenAI(
+            base_url=f"http://localhost:{VLLM_PORT}/v1",
+            api_key="EMPTY",
+            http_client=_http_client,
+        )
+
+        # 2. RAGAS structured-output judge (uses instructor + JSON mode)
+        # max_tokens=2048: ContextPrecision needs ~50 tokens × 7 docs = ~350 min;
+        # Faithfulness extracts then verifies all answer claims (~700-1500 tokens).
+        # 512 was too small → truncated JSON → InstructorRetryException × 804.
         ragas_llm = llm_factory(
             model="meta-llama/Llama-3.1-8B-Instruct",
-            client=local_client,
-            max_tokens=512,   # Cap judge output; without this vLLM generates indefinitely
+            client=async_client,
+            max_tokens=8192, #2048, increased to 8192 to handle larger outputs and avoid truncation that affects Answer Relevancy metric.
             temperature=0.0,
         )
         
@@ -142,14 +171,25 @@ def get_hardware_aware_models():
             max_tokens=8,     # ALCE only needs TRUE/FALSE — cap to prevent runaway generation
         )
         
-        # 4. Use RAGAS native HuggingFace embeddings
-        ragas_embeddings = RagasHuggingFaceEmbeddings(
-            model="nomic-ai/nomic-embed-text-v1.5",
-            device="cuda",
-            trust_remote_code=True,
-            normalize_embeddings=True,
-            prompts={"query": "search_query: ", "document": "search_document: "},  # nomic-embed-text-v1.5 task prefixes
-            default_prompt_name="query",
+        # 4. LangChain HuggingFaceEmbeddings wrapped with LangchainEmbeddingsWrapper.
+        # Root cause of AttributeError: RagasHuggingFaceEmbeddings (huggingface_provider)
+        # extends BaseRagasEmbedding (embed_text interface only), NOT BaseRagasEmbeddings
+        # (embed_query interface).  AnswerRelevancy internally calls embed_query, which is
+        # absent on the old class.  LangchainEmbeddingsWrapper extends BaseRagasEmbeddings
+        # and delegates embed_query to the wrapped LangChain object, which implements it.
+        # langchain_huggingface docs confirm: prompts, default_prompt_name, trust_remote_code
+        # are valid model_kwargs (forwarded to SentenceTransformer constructor, sbert.net docs).
+        ragas_embeddings = LangchainEmbeddingsWrapper(
+            LCHuggingFaceEmbeddings(
+                model_name="nomic-ai/nomic-embed-text-v1.5",
+                model_kwargs={
+                    "device": "cuda",
+                    "trust_remote_code": True,
+                    "prompts": {"query": "search_query: ", "document": "search_document: "},
+                    "default_prompt_name": "query",
+                },
+                encode_kwargs={"normalize_embeddings": True},
+            )
         )
 
     else:
@@ -164,14 +204,18 @@ def get_hardware_aware_models():
         ragas_llm = llm_factory(model="llama3", client=ollama_client, max_tokens=512, temperature=0.0)
         local_judge_llm = ChatOllama(model="llama3", temperature=0.0, num_predict=8)
         
-        # CPU Fallback uses RAGAS native HuggingFace embeddings
-        ragas_embeddings = RagasHuggingFaceEmbeddings(
-            model="nomic-ai/nomic-embed-text-v1.5",
-            device="cpu",
-            trust_remote_code=True,
-            normalize_embeddings=True,
-            prompts={"query": "search_query: ", "document": "search_document: "},  # nomic-embed-text-v1.5 task prefixes
-            default_prompt_name="query",
+        # CPU Fallback — same wrapper pattern as GPU path
+        ragas_embeddings = LangchainEmbeddingsWrapper(
+            LCHuggingFaceEmbeddings(
+                model_name="nomic-ai/nomic-embed-text-v1.5",
+                model_kwargs={
+                    "device": "cpu",
+                    "trust_remote_code": True,
+                    "prompts": {"query": "search_query: ", "document": "search_document: "},
+                    "default_prompt_name": "query",
+                },
+                encode_kwargs={"normalize_embeddings": True},
+            )
         )
         
     return local_judge_llm, ragas_llm, ragas_embeddings, is_gpu
@@ -218,17 +262,53 @@ def run_evaluation(input_csv: str = None, output_csv: str = None):
     # 2. DYNAMIC HARDWARE CONFIGURATION
     if is_gpu:
         eval_batch_size = 16
-        max_workers = 4    # Reduced from 16: fewer concurrent calls prevents vLLM timeout cascade
-        timeout = 600      # 10 minutes max (GPUs are fast)
+        max_workers = 20 #vLLM can handle 20 concurrent    # ≤2 concurrent rows: limits simultaneous httpx connections to vLLM
+        timeout = 600.0    # 10 minutes max (GPUs are fast); float required by httpx
     else:
         eval_batch_size = 1
         max_workers = 1    # CRITICAL: Prevent Ollama queue timeouts
-        timeout = 2400     # 40 minutes max (CPUs are slow)
+        timeout = 2400.0   # 40 minutes max (CPUs are slow); float required by httpx
+
+    # FIX: RunConfig(timeout=...) sets the RAGAS-level wait but does NOT propagate
+    # to the httpx socket layer used by LangChain / the OpenAI SDK.  httpx has its
+    # own default read timeout (~300 s) that drops the socket before RAGAS fires
+    # when vLLM is generating long batches.  We must inject the hardware-derived
+    # timeout directly into a custom httpx.AsyncClient passed to ChatOpenAI.
+    # Sources:
+    #   OpenAI Python SDK docs — custom httpx.Client for timeout override.
+    #   LangChain ChatOpenAI API — http_client / http_async_client kwargs.
+    if is_gpu:
+        _ragas_http_sync = httpx.Client(
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                max_connections=10,
+                keepalive_expiry=4.0,  # 1 s margin below Uvicorn default 5 s
+            ),
+            timeout=httpx.Timeout(connect=30.0, read=timeout, write=30.0, pool=60.0),
+        )
+        _ragas_http_async = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                max_connections=10,
+                keepalive_expiry=4.0,  # 1 s margin below Uvicorn default 5 s
+            ),
+            timeout=httpx.Timeout(connect=30.0, read=timeout, write=30.0, pool=60.0),
+        )
+        ragas_llm = ChatOpenAI(
+            model="meta-llama/Llama-3.1-8B-Instruct",
+            base_url="http://localhost:8000/v1",
+            api_key="EMPTY",
+            temperature=0.0,
+            max_tokens=2048,
+            max_retries=6,
+            http_client=_ragas_http_sync,
+            http_async_client=_ragas_http_async,
+        )
 
     run_config = RunConfig(
         timeout=timeout,
-        max_retries=3,     # Retry failed judge calls before marking row as NaN
-        max_wait=60,
+        max_retries=6,     # More retries: vLLM may queue briefly under load
+        max_wait=120,      # Longer backoff ceiling (was 60 s)
         max_workers=max_workers,
     )
 

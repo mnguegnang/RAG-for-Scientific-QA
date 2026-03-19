@@ -1,4 +1,4 @@
-# QASPER Scientific Question Answering — RAG System
+# RAG System for answering Scientific questions in NLP
 
 This **Retrieval-Augmented Generation (RAG)** pipeline enables open-domain question answering over scientific papers. When provided with a natural-language question, the system retrieves relevant passages from a local FAISS and BM25 index, reranks them using a cross-encoder, and employs a local LLM to generate a cited, well-supported answer.
 
@@ -41,7 +41,7 @@ User Query
     ▼
 ┌──────────────────────────────────────┐
 │  Stage 2 — BGE Cross-Encoder         │
-│  BAAI/bge-reranker-v2-m3 → top-7    │
+│  BAAI/bge-reranker-v2-m3 → top-7     │
 └──────────────────────────────────────┘
     │
     ▼
@@ -54,7 +54,7 @@ User Query
     ▼
 ┌──────────────────────────────────────────────────────┐
 │  Stage 4 — Generation                                │
-│  Llama-3.1-8B-Instruct (vLLM / HuggingFace / Ollama)│
+│  Llama-3.1-8B-Instruct (vLLM / HuggingFace / Ollama) │
 │  Chain-of-Thought + [Doc N] citation prompt          │
 └──────────────────────────────────────────────────────┘
     │

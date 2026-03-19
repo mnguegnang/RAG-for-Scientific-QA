@@ -1,13 +1,23 @@
 import os
+import yaml
 import requests
 import logging
 import json
 import sys
 import torch
+from pathlib import Path
 from typing import List, Dict, Any
 
 # Configure standard logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ── Load prompt templates from configs/prompts.yaml ──────────────────────
+_PROMPTS_PATH = Path(__file__).resolve().parents[2] / "configs" / "prompts.yaml"
+try:
+    with open(_PROMPTS_PATH) as _f:
+        _GEN_CFG = yaml.safe_load(_f).get("generation", {})
+except (FileNotFoundError, Exception):
+    _GEN_CFG = {}
 
 # Default HuggingFace model used when backend="transformers"
 # Llama-3.1-8B-Instruct fits in ~16GB VRAM (BF16); well within one A100-80GB.
@@ -132,31 +142,37 @@ class LocalLLMGenerator:
 
             context_str += f"[Doc {i}]\nSource: {doc_id}{score_str}\nContent: {doc.get('text', '')}\n\n"
 
-        # 2. Construct the strict instructional prompt
-        prompt = f"""You are a precise scientific AI research assistant. Answer the user's query based ONLY on the provided context.
-
-<Context>
-{context_str}
-</Context>
-
-<Instructions>
-0. Paper Focus: First, identify which single document is most directly relevant to the question. Anchor your answer primarily to that document. Mention other documents only if they add genuinely complementary information.
-1. Comprehension: Read the context carefully. If the context does not contain the answer, reply exactly with: "The retrieved documents do not contain enough information to answer this." Do not guess.
-2. Chain of Thought: Provide a brief <Reasoning> section where you outline your logic based on the documents.
-3. Citations: Provide a <Final Answer> section. Every factual claim MUST end with the citation tag of the document it originated from, e.g., [Doc 1] or [Doc 2].
-</Instructions>
-
-<User Query>
-{query}
-
-<Output Format>
-<Reasoning>
-(your step-by-step thinking)
-</Reasoning>
-<Final Answer>
-(your synthesized, cited answer)
-</Final Answer>
-"""
+        # 2. Build prompt from configs/prompts.yaml template
+        # Falls back to the hardcoded default if the YAML is unavailable.
+        paper_focus = _GEN_CFG.get(
+            "paper_focus_instruction",
+            "0. Paper Focus: First, identify which single document is most directly "
+            "relevant to the question. Anchor your answer primarily to that document. "
+            "Mention other documents only if they add genuinely complementary information.",
+        )
+        template = _GEN_CFG.get("rag_prompt_template", None)
+        if template:
+            prompt = template.format(
+                context_str=context_str,
+                paper_focus_instruction=paper_focus,
+                query=query,
+            )
+        else:
+            # Inline fallback (identical to the YAML template above)
+            prompt = (
+                f"You are a precise scientific AI research assistant. "
+                f"Answer the user's query based ONLY on the provided context.\n\n"
+                f"<Context>\n{context_str}\n</Context>\n\n"
+                f"<Instructions>\n{paper_focus}\n"
+                f"1. Comprehension: Read the context carefully. If the context does not "
+                f"contain the answer, reply exactly with: \"The retrieved documents do not "
+                f"contain enough information to answer this.\" Do not guess.\n"
+                f"2. Chain of Thought: Provide a brief <Reasoning> section.\n"
+                f"3. Citations: Every factual claim MUST end with the source tag, e.g., [Doc 1].\n"
+                f"</Instructions>\n\n<User Query>\n{query}\n\n"
+                f"<Output Format>\n<Reasoning>\n(your step-by-step thinking)\n"
+                f"</Reasoning>\n<Final Answer>\n(your synthesized, cited answer)\n</Final Answer>\n"
+            )
         return prompt
 
     def generate_answer(self, query: str, retrieved_docs: List[Dict[str, Any]]) -> str:

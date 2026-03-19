@@ -127,7 +127,7 @@ def generate_evaluation_dataset(output_path: str = None):
     )
     
     # 2. Get the evaluation questions use 250 for sample testing 
-    qa_pairs = fetch_qasper_sample(200)#num_samples=250
+    qa_pairs = fetch_qasper_sample(150)#num_samples=250
     
     results = []
     logging.info(f"Generating RAG answers for {len(qa_pairs)} questions...")
@@ -149,12 +149,21 @@ def generate_evaluation_dataset(output_path: str = None):
         # The order here matches the [Doc N] citation numbering used by the generator.
         context_strings = [doc["text"] for doc in retrieved_docs]
 
+        # best_rerank_score: the highest logit from the cross-encoder over
+        # the reranked docs.  Saved here so calibrate_crag.py can derive
+        # a data-driven CRAG threshold without requiring RAGAS scores first.
+        best_score = max(
+            (d.get("rerank_score", float("-inf")) for d in retrieved_docs),
+            default=float("-inf"),
+        )
         results.append({
-            "question":     qa["question"],
-            "ground_truth": qa["ground_truth"],
-            "contexts":     context_strings,
-            "answer":       answer,          # Final Answer only — used by RAGAS + ALCE
-            "full_answer":  full_answer,     # Full LLM output — kept for debugging
+            "question":          qa["question"],
+            "ground_truth":      qa["ground_truth"],
+            "contexts":          context_strings,
+            "answer":            answer,          # Final Answer only — used by RAGAS + ALCE
+            "full_answer":       full_answer,     # Full LLM output — kept for debugging
+            "best_rerank_score": best_score,      # Used by calibrate_crag.py
+            "crag_triggered":    pipeline_output.get("crag_triggered", False),
         })
         
     # 3. Save to disk
