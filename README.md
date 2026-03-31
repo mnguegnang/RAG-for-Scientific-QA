@@ -84,7 +84,7 @@ User Query
 - **HuggingFace account with access to `meta-llama/Llama-3.1-8B-Instruct`**
   Request access at: https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct
 
-> For SLURM cluster usage, 3× A100-SXM4-80GB GPUs are used: GPUs 0–1 for vLLM (tensor-parallel), GPU 2 for encoders and reranker.
+> For SLURM cluster usage, 2× A100-SXM4-80GB GPUs are used: GPU 0 for vLLM (tensor-parallel), GPU 1 for encoders and reranker.
 
 ---
 
@@ -231,7 +231,7 @@ Steps performed:
 | `overlap_pct` | `retrieval/chunking.py` | `0.1` | Overlap fraction (50 tokens) |
 | `CRAG_THRESHOLD` | `run_rag.py` | `0.0` | BGE logit below which generation is suppressed |
 | `HYDE_QUERY_WORD_THRESHOLD` | `run_rag.py` | `10` | Queries shorter than this trigger HyDE |
-| `retrieval k` | `run_rag.py` | `50` | Broad candidates from hybrid retrieval |
+| `retrieval k` | `run_rag.py` | `60` | Broad candidates from hybrid retrieval |
 | `rerank top_k` | `run_rag.py` | `7` | Documents passed to the LLM |
 | `rrf_k` | `retrieval/hybrid_retriever.py` | `60` | RRF constant (Cormack et al. 2009) |
 | `gpu_memory_utilization` | `run_evaluation.sh` | `0.85` | vLLM GPU memory fraction |
@@ -326,7 +326,7 @@ qasper-rag-scientific-qa/
 │       ├── generate_predictions.py # Run RAG over QASPER → evaluation_dataset.csv
 │       ├── evaluate_rag.py         # RAGAS + ALCE scorer → evaluation_report.csv
 │       └── calibrate_crag.py       # CRAG threshold calibration
-├── run_evaluation.sh               # SLURM batch job (3× A100-SXM4-80GB)
+├── run_evaluation.sh               # SLURM batch job 
 └── src/run_pipeline_ingest.sh      # SLURM batch job for index building
 ```
 
