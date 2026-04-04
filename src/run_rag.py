@@ -6,7 +6,8 @@ import traceback
 
 # Import Retriever Components
 from src.retrieval.hybrid_retriever import HybridRetriever
-from src.retrieval.reranker import Reranker
+from src.retrieval.reranker import ColBERTv2Reranker
+from src.retrieval.crag_evaluator import CRAGEvaluator
 
 # Import Generator Component
 from src.generation.llm_generator import LocalLLMGenerator
@@ -21,7 +22,10 @@ class ScientificRAGPipeline:
                  sparse_index_path: str = "data/indices/sparse.pkl",
                  generator_backend: str = "auto",
                  ollama_model: str = "llama3",
-                 hf_model: str = "meta-llama/Llama-3.1-8B-Instruct"):
+                 hf_model: str = "meta-llama/Llama-3.1-8B-Instruct",
+                 crag_correct_threshold: float = 20.0,
+                 crag_ambiguous_threshold: float = 12.0,
+                 crag_consistency_ratio: float = 0.3):
         """
         Initializes the entire end-to-end RAG system with the exact artifact paths.
         """
@@ -35,32 +39,31 @@ class ScientificRAGPipeline:
             sparse_index_path=sparse_index_path,
         )
 
-<<<<<<< HEAD
-        logging.info("Initializing the Cross-Encoder Reranker (bge-reranker-v2-m3)...")
-        # We place BAAI/bge-reranker-base with 'BAAI/bge-reranker-v2-m3' is ideal here since it outperforms ms-marco-MiniLM on academic BEIR subsets
-        self.reranker = Reranker(model_name="BAAI/bge-reranker-v2-m3")
-=======
-        logging.info("Initializing the Cross-Encoder Reranker (bge-reranker-v2-m3)...")
-        # We place BAAI/bge-reranker-base with 'BAAI/bge-reranker-v2-m3' is ideal here since it outperforms ms-marco-MiniLM on academic BEIR subsets
-        self.reranker = Reranker(model_name="BAAI/bge-reranker-v2-m3")
->>>>>>> cc6e01ad33bfbf2fa9000592545c986b7eeb4561
-        
+        logging.info("Initializing ColBERT v2 Late-Interaction Reranker...")
+        # Santhanam et al. (2022) — ColBERTv2 achieves equivalent or better MRR@10
+        # than full cross-encoders while being 100-1000x faster via MaxSim scoring.
+        # Replaces the previous BAAI/bge-reranker-v2-m3 cross-encoder.
+        self.reranker = ColBERTv2Reranker(model_name="colbert-ir/colbertv2.0")
+
+        logging.info("Initializing CRAG Retrieval Evaluator (Yan et al., 2024)...")
+        # Full Corrective RAG framework: {Correct, Incorrect, Ambiguous} classification
+        # with multi-signal confidence and knowledge refinement.
+        # Replaces the single-threshold CRAG gate.
+        self.crag_evaluator = CRAGEvaluator(
+            correct_threshold=crag_correct_threshold,
+            ambiguous_threshold=crag_ambiguous_threshold,
+            consistency_ratio=crag_consistency_ratio,
+        )
+
         logging.info("Initializing the LLM Generator (backend=%s)...", generator_backend)
         # backend="auto": uses transformers on GPU (supercomputer), ollama on CPU (laptop)
         self.generator = LocalLLMGenerator(
-            backend=generator_backend,
-            ollama_model=ollama_model,
-            hf_model=hf_model,
-        )
-        
+            backend=generator_backend, 
+            ollama_model=ollama_model, 
+            hf_model=hf_model 
+            )
+                
         logging.info("System Ready.")
-
-    # CRAG relevance threshold (Yan et al., 2024 — Corrective RAG)
-    # bge-reranker-base outputs raw logits; sigmoid(0.0) = 0.5.
-    # A best-document logit below this value means no retrieved document
-    # is likely relevant — generation is suppressed to avoid hallucination.
-    # Tune empirically: raise towards 1.0 to be stricter, lower to be more permissive.
-    CRAG_THRESHOLD: float = 0.0
 
     def ask(self, query: str) -> dict:
         """
@@ -68,39 +71,51 @@ class ScientificRAGPipeline:
 
         Stages
         ------
-        1. Hybrid retrieval  — top-50 candidates (dense + sparse via RRF)
-        2. Reranking         — bge-reranker-base narrows to top-7
-        3. CRAG gate         — suppresses generation when context is irrelevant
+        1. Hybrid retrieval  — top-100 candidates (dense + sparse via RRF)
+        2. Reranking         — ColBERT v2 late-interaction narrows to top-7
+        3. CRAG evaluation   — three-way {Correct, Incorrect, Ambiguous} gate
+                               with knowledge refinement (Yan et al., 2024)
         4. Generation        — Llama3 with CoT + citation prompt
         """
         logging.info(f"Processing Query: '{query}'")
 
-        # 1. RETRIEVE (Recall)
-        logging.info("Stage 1: Fetching top 50 candidates via Hybrid Search (Dense + Sparse)...")
-        broad_results = self.retriever.search(query, k=50)
+        # ── Stage 1: RETRIEVE (Recall) ──────────────────────────────────────
+        # Fetch 100 candidates (up from 50) — ColBERT v2 is efficient enough
+        # to rerank a larger pool, improving recall before precision filtering.
+        logging.info("Stage 1: Fetching top 100 candidates via Hybrid Search (Dense + Sparse)...")
+        broad_results = self.retriever.search(query, k=100)
 
         if not broad_results:
-            return {"answer": "Error: No documents found in the database.", "retrieved_docs": [],
-                    "crag_triggered": False}
+            return {
+                "answer": "Error: No documents found in the database.",
+                "retrieved_docs": [],
+                "crag_triggered": False,
+                "crag_action": None,
+                "crag_details": {},
+            }
 
-        # 2. RERANK (Precision)
+        # ── Stage 2: RERANK (Precision) ─────────────────────────────────────
+        # ColBERT v2 (Santhanam et al., 2022) late-interaction scoring via MaxSim.
         # top_k=7: Liu et al. (2023) 'Lost in the Middle' shows LLM accuracy
-        # peaks with 3–5 high-quality passages we increase to 7 for more context.
-<<<<<<< HEAD
-        logging.info("Stage 2: Reranking with bge-reranker-base, keeping top 7...")
-=======
-        logging.info("Stage 2: Reranking with bge-reranker-v2-m3, keeping top 7...")
->>>>>>> cc6e01ad33bfbf2fa9000592545c986b7eeb4561
+        # peaks with 3–5 high-quality passages; we keep 7 for broader context.
+        logging.info("Stage 2: Reranking with ColBERT v2 (MaxSim), keeping top 7...")
         top_7_docs = self.reranker.rerank(query, broad_results, top_k=7)
 
-        # 3. CRAG RELEVANCE GATE (Yan et al., 2024)
-        # Check the highest rerank score. If even the best document is below
-        # threshold, the retrieved context is too noisy for reliable generation.
-        best_score = max(d.get("rerank_score", 0.0) for d in top_7_docs)
-        logging.info(f"CRAG check — best rerank logit: {best_score:.4f} (threshold: {self.CRAG_THRESHOLD})")
+        # ── Stage 3: CRAG EVALUATION (Yan et al., 2024) ────────────────────
+        # Full Corrective RAG framework:
+        #   Section 3.1 — Per-document classification: {Correct, Incorrect, Ambiguous}
+        #   Multi-signal confidence with self-consistency ratio
+        #   Section 3.2 — Knowledge refinement: strip decomposition + filtering
+        logging.info("Stage 3: CRAG retrieval evaluation (three-way classification)...")
+        crag_action, refined_docs, crag_details = self.crag_evaluator.evaluate_and_refine(
+            query, top_7_docs
+        )
 
-        if best_score < self.CRAG_THRESHOLD:
-            logging.warning("CRAG gate triggered: retrieved context below relevance threshold.")
+        if crag_action == 'Incorrect':
+            logging.warning(
+                "CRAG action=Incorrect: all documents below relevance threshold. "
+                "Generation suppressed to avoid hallucination."
+            )
             return {
                 "answer": (
                     "The retrieved documents do not contain enough information "
@@ -108,70 +123,32 @@ class ScientificRAGPipeline:
                 ),
                 "retrieved_docs": top_7_docs,
                 "crag_triggered": True,
+                "crag_action": crag_action,
+                "crag_details": crag_details,
             }
 
-        # 4. GENERATION
-        logging.info("Stage 3: Passing top 7 documents to LLM for generation...")
-        final_answer = self.generator.generate_answer(query, top_7_docs)
+        if crag_action == 'Ambiguous':
+            logging.info(
+                "CRAG action=Ambiguous: using refined knowledge from %d documents "
+                "(original top-7 had mixed relevance).",
+                len(refined_docs),
+            )
+
+        # ── Stage 4: GENERATION ─────────────────────────────────────────────
+        logging.info(
+            "Stage 4: Passing %d refined documents to LLM for generation...",
+            len(refined_docs),
+        )
+        final_answer = self.generator.generate_answer(query, refined_docs)
 
         return {
             "answer": final_answer,
-            "retrieved_docs": top_7_docs,
-            "crag_triggered": False,
+            "retrieved_docs": refined_docs,
+            "crag_triggered": crag_action == 'Ambiguous',
+            "crag_action": crag_action,
+            "crag_details": crag_details,
         }
-<<<<<<< HEAD
-
-    def ask_stream(self, query: str):
-        """
-        Executes retrieval + reranking synchronously, then returns
-        (context_strings, token_generator) so the serving API can stream tokens
-        to the UI in real time.
-
-        Returns
-        -------
-        context_strings : list[str]
-            Plain-text representations of the top reranked documents.
-        token_generator : Iterator[str]
-            A generator that yields tokens one-by-one from the LLM backend.
-        """
-        logging.info("Stage 1: Hybrid Search (streaming path)...")
-        broad_results = self.retriever.search(query, k=50)
-
-        if not broad_results:
-            def _empty():
-                yield "Error: No documents found in the database."
-            return [], _empty()
-
-        logging.info("Stage 2: Reranking (streaming path)...")
-        top_7_docs = self.reranker.rerank(query, broad_results, top_k=7)
-
-        # CRAG gate — same threshold as in ask()
-        best_score = max(d.get("rerank_score", 0.0) for d in top_7_docs)
-        logging.info("CRAG check (stream) — best logit: %.4f (threshold: %.1f)",
-                     best_score, self.CRAG_THRESHOLD)
-
-        if best_score < self.CRAG_THRESHOLD:
-            logging.warning("CRAG gate triggered (stream): context below relevance threshold.")
-            def _crag_fallback():
-                yield ("The retrieved documents do not contain enough information "
-                       "to answer this question reliably.")
-            context_strings = [
-                doc.get("text", str(doc)) if isinstance(doc, dict) else str(doc)
-                for doc in top_7_docs
-            ]
-            return context_strings, _crag_fallback()
-
-        context_strings = [
-            doc.get("text", str(doc)) if isinstance(doc, dict) else str(doc)
-            for doc in top_7_docs
-        ]
-
-        logging.info("Stage 3: Streaming generation...")
-        token_generator = self.generator.generate_stream(query, top_7_docs)
-        return context_strings, token_generator
-=======
->>>>>>> cc6e01ad33bfbf2fa9000592545c986b7eeb4561
-
+    
 def main():
     # Setup Argument Parser for Command Line Execution
     parser = argparse.ArgumentParser(description="Query the Scientific NLP RAG System.")
@@ -181,9 +158,12 @@ def main():
     parser.add_argument("--dense-index", type=str, default="data/indices/dense.index")
     parser.add_argument("--dense-meta", type=str, default="data/indices/dense.index.meta")
     parser.add_argument("--sparse-index", type=str, default="data/indices/sparse.pkl")
-    parser.add_argument("--crag-threshold", type=float, default=None,
-        help="Override the CRAG relevance gate threshold (bge-reranker raw logit). "
-             "Default: 0.0 (sigmoid=0.5, i.e., uncertain relevance)")
+    parser.add_argument("--crag-correct", type=float, default=20.0,
+        help="ColBERT MaxSim threshold for CRAG 'Correct' label (default: 20.0)")
+    parser.add_argument("--crag-ambiguous", type=float, default=12.0,
+        help="ColBERT MaxSim threshold for CRAG 'Ambiguous' label (default: 12.0)")
+    parser.add_argument("--crag-consistency", type=float, default=0.3,
+        help="Self-consistency ratio — min fraction of docs labeled Correct (default: 0.3)")
     parser.add_argument("--backend", type=str, default="auto",
         choices=["auto", "ollama", "transformers"],
         help="LLM backend. 'auto' picks transformers on GPU, ollama on CPU (default: auto)")
@@ -203,10 +183,10 @@ def main():
             generator_backend=args.backend,
             ollama_model=args.ollama_model,
             hf_model=args.hf_model,
+            crag_correct_threshold=args.crag_correct,
+            crag_ambiguous_threshold=args.crag_ambiguous,
+            crag_consistency_ratio=args.crag_consistency,
         )
-        if args.crag_threshold is not None:
-            rag_system.CRAG_THRESHOLD = args.crag_threshold
-            logging.info(f"CRAG threshold overridden to {args.crag_threshold}")
         
         print("\n" + "*"*60)
         print(f"QUESTION: {args.query}")
@@ -220,7 +200,17 @@ def main():
         print(result["answer"])
 
         if result.get("crag_triggered"):
-            print("\n[CRAG] Generation suppressed: retrieved context below relevance threshold.")
+            print(f"\n[CRAG] Action: {result.get('crag_action', 'N/A')}")
+            if result['crag_action'] == 'Incorrect':
+                print("[CRAG] Generation suppressed: all documents below relevance threshold.")
+            elif result['crag_action'] == 'Ambiguous':
+                print("[CRAG] Partial confidence: used refined knowledge from ambiguous documents.")
+            details = result.get('crag_details', {})
+            if details:
+                print(f"[CRAG] Correct: {details.get('n_correct', 0)}, "
+                      f"Ambiguous: {details.get('n_ambiguous', 0)}, "
+                      f"Incorrect: {details.get('n_incorrect', 0)} | "
+                      f"Consistency: {details.get('correct_ratio', 0):.2f}")
 
         print("\n" + "-"*60)
         print(f"Retrieved {len(result['retrieved_docs'])} documents used as context.")

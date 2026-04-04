@@ -219,6 +219,3 @@ class LocalLLMGenerator:
         print(answer)
         print("\n" + "="*92 + "\n")
         return answer
-=======
-        return answer
->>>>>>> cc6e01ad33bfbf2fa9000592545c986b7eeb4561

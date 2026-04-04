@@ -114,7 +114,7 @@ def generate_evaluation_dataset(output_path: str = None):
     )
     
     # 2. Get the evaluation questions currently limited to 20 for quick testing but will be increase in production
-    qa_pairs = fetch_qasper_sample()#num_samples=20
+    qa_pairs = fetch_qasper_sample(20)#num_samples=20
     
     results = []
     logging.info(f"Generating RAG answers for {len(qa_pairs)} questions...")
