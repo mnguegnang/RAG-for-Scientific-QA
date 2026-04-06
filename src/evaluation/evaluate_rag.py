@@ -102,10 +102,16 @@ class ALCE_RAGASevaluator:
         
         return precision, recall
 
-def run_evaluation(input_csv: str = "data/evaluation_dataset.csv", output_csv: str = "data/evaluation_report.csv"):
+def run_evaluation(input_csv: str = None, output_csv: str = None):
     """
     Orchestrates RAGAS and the ALCE Entailment metrics using entirely local infrastructure (CPU).
     """
+    _project_root = Path(__file__).resolve().parents[2]
+    if input_csv is None:
+        input_csv = str(_project_root / "data" / "evaluation_dataset.csv")
+    if output_csv is None:
+        output_csv = str(_project_root / "data" / "evaluation_report.csv")
+
     logging.info(f"Loading generated dataset from {input_csv}...")
     df = pd.read_csv(input_csv)
     
