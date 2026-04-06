@@ -1,12 +1,23 @@
+import os
+import yaml
 import requests
 import logging
 import json
 import sys
 import torch
+from pathlib import Path
 from typing import List, Dict, Any
 
 # Configure standard logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ── Load prompt templates from configs/prompts.yaml ──────────────────────
+_PROMPTS_PATH = Path(__file__).resolve().parents[2] / "configs" / "prompts.yaml"
+try:
+    with open(_PROMPTS_PATH) as _f:
+        _GEN_CFG = yaml.safe_load(_f).get("generation", {})
+except (FileNotFoundError, Exception):
+    _GEN_CFG = {}
 
 # Default HuggingFace model used when backend="transformers"
 # Llama-3.1-8B-Instruct fits in ~16GB VRAM (BF16); well within one A100-80GB.
@@ -42,7 +53,16 @@ class LocalLLMGenerator:
     ):
         # ── Resolve backend ──────────────────────────────────────────────────
         if backend == "auto":
-            backend = "transformers" if torch.cuda.is_available() else "ollama"
+            # GENERATOR_BACKEND env var lets the SLURM script request the
+            # vllm backend (pointing to an already-running vLLM server)
+            # without changing Python code.  Falls back to original heuristic.
+            env_backend = os.environ.get("GENERATOR_BACKEND", "").strip().lower()
+            if env_backend in {"vllm", "ollama", "transformers"}:
+                backend = env_backend
+            elif torch.cuda.is_available():
+                backend = "transformers"
+            else:
+                backend = "ollama"
             logging.info("[LLMGenerator] backend=auto resolved to: %s", backend)
 
         self.backend = backend
@@ -57,8 +77,22 @@ class LocalLLMGenerator:
             self.model_name = hf_model
             self._load_hf_pipeline()
 
+        elif self.backend == "vllm":
+            # Route generation to a pre-running vLLM server that exposes an
+            # OpenAI-compatible API.  No local weights are loaded in this
+            # process, freeing GPU memory for SPECTER2 and the reranker.
+            self.model_name = hf_model
+            self.vllm_url = os.environ.get("VLLM_API_URL", "http://localhost:8000/v1")
+            logging.info(
+                "[LLMGenerator] Using vLLM backend | url: %s | model: %s",
+                self.vllm_url, self.model_name,
+            )
+
         else:
-            raise ValueError(f"Unknown backend '{backend}'. Choose 'auto', 'ollama', or 'transformers'.")
+            raise ValueError(
+                f"Unknown backend '{backend}'. "
+                "Choose 'auto', 'ollama', 'transformers', or 'vllm'."
+            )
 
     # ── HuggingFace pipeline loader ───────────────────────────────────────────
     def _load_hf_pipeline(self):
@@ -108,30 +142,37 @@ class LocalLLMGenerator:
 
             context_str += f"[Doc {i}]\nSource: {doc_id}{score_str}\nContent: {doc.get('text', '')}\n\n"
 
-        # 2. Construct the strict instructional prompt
-        prompt = f"""You are a precise scientific AI research assistant. Answer the user's query based ONLY on the provided context.
-
-<Context>
-{context_str}
-</Context>
-
-<Instructions>
-1. Comprehension: Read the context carefully. If the context does not contain the answer, reply exactly with: "The retrieved documents do not contain enough information to answer this." Do not guess.
-2. Chain of Thought: Provide a brief <Reasoning> section where you outline your logic based on the documents.
-3. Citations: Provide a <Final Answer> section. Every factual claim MUST end with the citation tag of the document it originated from, e.g., [Doc 1] or [Doc 2].
-</Instructions>
-
-<User Query>
-{query}
-
-<Output Format>
-<Reasoning>
-(your step-by-step thinking)
-</Reasoning>
-<Final Answer>
-(your synthesized, cited answer)
-</Final Answer>
-"""
+        # 2. Build prompt from configs/prompts.yaml template
+        # Falls back to the hardcoded default if the YAML is unavailable.
+        paper_focus = _GEN_CFG.get(
+            "paper_focus_instruction",
+            "0. Paper Focus: First, identify which single document is most directly "
+            "relevant to the question. Anchor your answer primarily to that document. "
+            "Mention other documents only if they add genuinely complementary information.",
+        )
+        template = _GEN_CFG.get("rag_prompt_template", None)
+        if template:
+            prompt = template.format(
+                context_str=context_str,
+                paper_focus_instruction=paper_focus,
+                query=query,
+            )
+        else:
+            # Inline fallback (identical to the YAML template above)
+            prompt = (
+                f"You are a precise scientific AI research assistant. "
+                f"Answer the user's query based ONLY on the provided context.\n\n"
+                f"<Context>\n{context_str}\n</Context>\n\n"
+                f"<Instructions>\n{paper_focus}\n"
+                f"1. Comprehension: Read the context carefully. If the context does not "
+                f"contain the answer, reply exactly with: \"The retrieved documents do not "
+                f"contain enough information to answer this.\" Do not guess.\n"
+                f"2. Chain of Thought: Provide a brief <Reasoning> section.\n"
+                f"3. Citations: Every factual claim MUST end with the source tag, e.g., [Doc 1].\n"
+                f"</Instructions>\n\n<User Query>\n{query}\n\n"
+                f"<Output Format>\n<Reasoning>\n(your step-by-step thinking)\n"
+                f"</Reasoning>\n<Final Answer>\n(your synthesized, cited answer)\n</Final Answer>\n"
+            )
         return prompt
 
     def generate_answer(self, query: str, retrieved_docs: List[Dict[str, Any]]) -> str:
@@ -146,6 +187,8 @@ class LocalLLMGenerator:
 
         if self.backend == "ollama":
             return self._generate_ollama(full_prompt)
+        elif self.backend == "vllm":
+            return self._generate_vllm(full_prompt)
         else:
             return self._generate_transformers(full_prompt)
 
@@ -199,6 +242,34 @@ class LocalLLMGenerator:
             logging.error("[Ollama] Connection failed: %s", e)
             return f"System Error: Could not connect to Ollama at {self.api_url}. Is 'ollama serve' running?"
 
+    # ── vLLM backend (OpenAI-compatible server) ──────────────────────────────────
+    def _generate_vllm(self, full_prompt: str) -> str:
+        """Calls a vLLM server's OpenAI-compatible chat-completions endpoint."""
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "The 'openai' package is required for the vllm backend. "
+                "Install it with: pip install openai"
+            ) from exc
+
+        logging.info(
+            "[vLLM] Sending prompt to %s | model=%s",
+            self.vllm_url, self.model_name,
+        )
+        client = OpenAI(base_url=self.vllm_url, api_key="EMPTY")
+        resp = client.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": full_prompt}],
+            max_tokens=1024,
+            temperature=0.1,
+        )
+        answer = resp.choices[0].message.content or ""
+        print("\n" + "="*40 + " LLM OUTPUT (vLLM) " + "="*40 + "\n")
+        print(answer)
+        print("\n" + "="*92 + "\n")
+        return answer
+
     # ── HuggingFace transformers backend ──────────────────────────────────────
     def _generate_transformers(self, full_prompt: str) -> str:
         """Generates answer using HuggingFace pipeline directly on GPU."""
@@ -219,3 +290,67 @@ class LocalLLMGenerator:
         print(answer)
         print("\n" + "="*92 + "\n")
         return answer
+
+    # ── HyDE: Hypothetical Document Embedding ──────────────────────────────────
+    def generate_hypothetical_answer(self, query: str) -> str:
+        """
+        Generates a brief hypothetical passage for HyDE dense retrieval.
+
+        Asks the LLM to write a concise 2-3 sentence factual passage that
+        would directly answer *query*, as if extracted from a scientific paper.
+        This passage is then encoded by SPECTER2 in place of the raw query,
+        closing the query-document semantic gap.
+
+        Reference:
+            Gao et al. (2022). Precise Zero-Shot Dense Retrieval without
+            Relevance Labels (HyDE). arXiv:2212.10496. ACL 2023.
+            — Encoding a hypothetical passage improves nDCG@10 by 5-15 points
+              on academic benchmarks vs. encoding the raw question.
+        """
+        hyde_prompt = (
+            "You are a scientific assistant. Write a concise 2-3 sentence "
+            "factual passage that would directly answer the following question, "
+            "as if it were extracted verbatim from a scientific paper. "
+            "State facts directly without hedging.\n\n"
+            f"Question: {query}\n\n"
+            "Hypothetical passage:"
+        )
+        if self.backend == "ollama":
+            payload = {
+                "model": self.model_name,
+                "prompt": hyde_prompt,
+                "stream": False,
+                "options": {"temperature": 0.3, "num_predict": 200},
+            }
+            try:
+                resp = requests.post(self.api_url, json=payload, timeout=60)
+                resp.raise_for_status()
+                return resp.json().get("response", "").strip() or query
+            except Exception as exc:
+                logging.warning("[HyDE/Ollama] generation failed: %s", exc)
+                return query  # fallback: use original query
+        elif self.backend == "vllm":
+            try:
+                from openai import OpenAI
+                client = OpenAI(base_url=self.vllm_url, api_key="EMPTY")
+                resp = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": hyde_prompt}],
+                    max_tokens=200,
+                    temperature=0.3,
+                )
+                text = (resp.choices[0].message.content or "").strip()
+                return text if text else query
+            except Exception as exc:
+                logging.warning("[HyDE/vLLM] generation failed: %s", exc)
+                return query
+        else:
+            outputs = self.pipe(
+                hyde_prompt,
+                max_new_tokens=200,
+                do_sample=True,
+                temperature=0.3,
+                return_full_text=False,
+            )
+            text = outputs[0]["generated_text"].strip()
+            return text if text else query

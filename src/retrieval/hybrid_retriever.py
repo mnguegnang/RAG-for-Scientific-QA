@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from collections import defaultdict
 from src.retrieval.encoders import Specter2Encoder
+from src.retrieval.sparse_store import tokenize_for_bm25
 
 logger = logging.getLogger(__name__)
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -43,10 +44,18 @@ class HybridRetriever:
             #self.bm25_corpus = self.bm25_package['metadata'] # The actual chunks
             #self.bm25_ids = self.bm25_package['doc_ids'] # The IDs
             
-    def _search_dense(self, query: str, k: int):
-        """Standard Vector Search"""
-        # Encode query
-        q_vec = self.encoder.encode([query])
+    def _search_dense(self, query: str, k: int, dense_query: str = None):
+        """Standard Vector Search.
+
+        Parameters
+        ----------
+        dense_query : str, optional
+            When provided (e.g. a HyDE hypothetical passage), this text is
+            encoded for dense search instead of *query*. The original *query*
+            is still used for BM25 sparse search. Defaults to None.
+        """
+        # Encode query (or a HyDE hypothetical passage when provided)
+        q_vec = self.encoder.encode([dense_query if dense_query else query])
         # FAISS expects float32 normalized vectors for IP search (if model output is normalized)
         # Note: BGE output is usually normalized, but good practice to ensure.
         faiss.normalize_L2(q_vec)
@@ -66,8 +75,10 @@ class HybridRetriever:
 
     def _search_sparse(self, query: str, k: int):
         """Standard BM25 Search"""
-        # We need to tokenize the query exactly how we tokenized the documents for sparce store indexing
-        tokenized_query = query.lower().split() 
+        # tokenize_for_bm25: identical pipeline to index-time (LaTeX strip +
+        # lowercase + NLTK word_tokenize + stop-word removal + Porter stemming).
+        # Robertson & Zaragoza (2009), BM25 and Beyond.
+        tokenized_query = tokenize_for_bm25(query)
         
         # Get scores
         scores = self.bm25.get_scores(tokenized_query)
@@ -86,13 +97,31 @@ class HybridRetriever:
             })
         return results
 
-    def search(self, query: str, k: int = 10, rrf_k: int = 60):
+    def search(self, query: str, k: int = 10, rrf_k: int = 60,
+               dense_query: str = None, filter_paper_id: str = None):
         """
         Performs Hybrid Search using RRF.
+
+        Parameters
+        ----------
+        dense_query : str, optional
+            Override the text encoded for the dense (SPECTER2) leg only.
+            Pass a HyDE hypothetical passage here for short queries.
+            BM25 sparse search always uses the original *query*.
         """
         # 1. Get Independent Results
-        dense_res = self._search_dense(query, k)
-        sparse_res = self._search_sparse(query, k)
+        # Fetch more candidates when paper-scoped filtering is active so that
+        # after the paper_id post-filter we still return up to k results.
+        # Dasigi et al. (2021 NAACL) — QASPER questions are anchored to one paper;
+        # cross-paper retrieval always produces ALCE=0 because cited evidence
+        # never entails the ground truth from a different paper.
+        broad_k = k * 4 if filter_paper_id else k
+        dense_res = self._search_dense(query, broad_k, dense_query=dense_query)
+        sparse_res = self._search_sparse(query, broad_k)
+
+        if filter_paper_id:
+            dense_res  = [r for r in dense_res  if r.get("doc_id") == filter_paper_id][:k]
+            sparse_res = [r for r in sparse_res if r.get("doc_id") == filter_paper_id][:k]
         
         # 2. Apply RRF
         # Map unique text/ID to accumulated score

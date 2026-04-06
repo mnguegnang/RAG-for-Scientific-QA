@@ -1,0 +1,46 @@
+========================================
+Job ID    : 27965
+Node      : cc-gpu02-n01
+Project   : /home/math/nguegnang/RAG_project/qasper-rag-scientific-qa
+Start     : 02:48:32
+========================================
+0, NVIDIA A100-SXM4-80GB, 81920 MiB, 81156 MiB
+1, NVIDIA A100-SXM4-80GB, 81920 MiB, 81156 MiB
+2, NVIDIA A100-SXM4-80GB, 81920 MiB, 81156 MiB
+CUDA_VISIBLE_DEVICES : 0,1,2
+GPUs visible for DataParallel: 3
+  GPU 0: NVIDIA A100-SXM4-80GB
+  GPU 1: NVIDIA A100-SXM4-80GB
+  GPU 2: NVIDIA A100-SXM4-80GB
+PyTorch : 2.10.0+cu128
+CUDA    : True
+Working directory: /home/math/nguegnang/RAG_project/qasper-rag-scientific-qa
+--- Starting pipeline_ingest at 02:48:49 ---
+=== Data Ingestion & Indexing ===
+Loading QASPER dataset from HuggingFace...
+Loaded 888 papers.
+
+--- Sample Schema ---
+ID: 1909.00694
+Title: Minimally Supervised Learning of Affective Events Using Discourse Relations
+Section Keys: ['Introduction', 'Related Work', 'Proposed Method']...
+Processing subset of 888 papers.
+
+--- Chunking ---
+Result: Generated 47798 chunks.
+
+--- Dense Indexing (FAISS) ---
+Generating embeddings for 47798 chunks on cuda (3 GPU(s))  |  batch_size=192...
+Dense Index built with 47798 vectors.
+Saved dense index to /home/math/nguegnang/RAG_project/qasper-rag-scientific-qa/data/indices/dense.index
+Saved metadata to /home/math/nguegnang/RAG_project/qasper-rag-scientific-qa/data/indices/dense.index.meta
+
+--- Sparse Indexing (BM25) ---
+Tokenizing corpus for BM25 (stop-word removal + Porter stemming)...
+BM25 Index built.
+Saved sparse index to /home/math/nguegnang/RAG_project/qasper-rag-scientific-qa/data/indices/sparse.pkl
+
+=== Ingestion Complete ===
+Files created in /home/math/nguegnang/RAG_project/qasper-rag-scientific-qa/data/indices:
+['dense.index', 'dense.index.meta', 'sparse.pkl']
+--- Finished at 02:52:08 with exit code 0 ---

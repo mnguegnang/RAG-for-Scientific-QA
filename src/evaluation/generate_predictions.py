@@ -86,8 +86,9 @@ def fetch_qasper_sample(num_samples: int = 10) -> List[Dict]:
             for ans in ans_list:
                 if ans['free_form_answer']:
                     qa_pairs.append({
-                        "question": q,
-                        "ground_truth": ans['free_form_answer']
+                        "question":     q,
+                        "ground_truth": ans['free_form_answer'],
+                        "paper_id":     row["id"],  # QASPER paper ID — used to scope retrieval
                     })
                     break # Stop if we found a valid answer for this question
         
@@ -105,16 +106,28 @@ def generate_evaluation_dataset(output_path: str = None):
     if output_path is None:
         output_path = str(_project_root / "data" / "evaluation_dataset.csv")
 
-    # 1. Initialize the Orchestrator (loads FAISS, Cross-Encoder, Ollama)
-    logging.info("Initializing Scientific RAG Pipeline...")
+    # 1. Initialize the Orchestrator (loads FAISS, Cross-Encoder, and the
+    #    configured LLM backend).
+    #
+    #    When GENERATOR_BACKEND=vllm is set in the environment (e.g. from
+    #    run_evaluation.sh), the pipeline routes generation requests to the
+    #    already-running vLLM server instead of loading the weights here.
+    #    This frees GPU memory on this process for SPECTER2 and the reranker.
+    import os
+    generator_backend = os.environ.get("GENERATOR_BACKEND", "auto")
+    logging.info(
+        "Initializing Scientific RAG Pipeline (generator_backend=%s)...",
+        generator_backend,
+    )
     rag_pipeline = ScientificRAGPipeline(
         dense_index_path="data/indices/dense.index",
         dense_meta_path="data/indices/dense.index.meta",
         sparse_index_path="data/indices/sparse.pkl",
+        generator_backend=generator_backend,
     )
     
-    # 2. Get the evaluation questions currently limited to 20 for quick testing but will be increase in production
-    qa_pairs = fetch_qasper_sample(20)#num_samples=20
+    # 2. Get the evaluation questions use 150 for sample testing
+    qa_pairs = fetch_qasper_sample(150)#num_samples=150
     
     results = []
     logging.info(f"Generating RAG answers for {len(qa_pairs)} questions...")
@@ -124,7 +137,7 @@ def generate_evaluation_dataset(output_path: str = None):
         
         
         # The pipeline's ask() returns {"answer": <full LLM output>, "retrieved_docs": [...]}
-        pipeline_output = rag_pipeline.ask(qa["question"])
+        pipeline_output = rag_pipeline.ask(qa["question"], filter_paper_id=qa.get("paper_id"))
         full_answer = pipeline_output["answer"]
         retrieved_docs = pipeline_output["retrieved_docs"]
 
@@ -136,12 +149,21 @@ def generate_evaluation_dataset(output_path: str = None):
         # The order here matches the [Doc N] citation numbering used by the generator.
         context_strings = [doc["text"] for doc in retrieved_docs]
 
+        # best_rerank_score: the highest logit from the cross-encoder over
+        # the reranked docs.  Saved here so calibrate_crag.py can derive
+        # a data-driven CRAG threshold without requiring RAGAS scores first.
+        best_score = max(
+            (d.get("rerank_score", float("-inf")) for d in retrieved_docs),
+            default=float("-inf"),
+        )
         results.append({
-            "question":     qa["question"],
-            "ground_truth": qa["ground_truth"],
-            "contexts":     context_strings,
-            "answer":       answer,          # Final Answer only — used by RAGAS + ALCE
-            "full_answer":  full_answer,     # Full LLM output — kept for debugging
+            "question":          qa["question"],
+            "ground_truth":      qa["ground_truth"],
+            "contexts":          context_strings,
+            "answer":            answer,          # Final Answer only — used by RAGAS + ALCE
+            "full_answer":       full_answer,     # Full LLM output — kept for debugging
+            "best_rerank_score": best_score,      # Used by calibrate_crag.py
+            "crag_triggered":    pipeline_output.get("crag_triggered", False),
         })
         
     # 3. Save to disk
