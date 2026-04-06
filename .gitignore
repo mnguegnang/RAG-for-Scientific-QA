@@ -87,3 +87,6 @@ target/
 
 # Mypy cache
 .mypy_cache/
+
+# Shell-redirect artifacts from unquoted pip install commands (e.g. pip install pkg>=0.0.8)
+=*
