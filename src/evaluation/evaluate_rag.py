@@ -17,11 +17,11 @@ from ragas.run_config import RunConfig
 # Import from ragas.metrics (classic API) — compatible with evaluate()
 from ragas.metrics import ContextPrecision, ContextRecall, Faithfulness, AnswerRelevancy
 from ragas.llms import LangchainLLMWrapper
-from ragas.embeddings import LangchainEmbeddingsWrapper
+from ragas.embeddings import HuggingFaceEmbeddings as RagasHFEmbeddings
 
 # Modern LangChain Core & Local Ollama Imports
 from langchain_core.messages import HumanMessage
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_ollama import ChatOllama
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -114,12 +114,23 @@ def run_evaluation(input_csv: str = "data/evaluation_dataset.csv", output_csv: s
     
     # Initialize the Local LLM Judge Models. Using Llama 3 for text grading
     local_judge_llm = ChatOllama(model="llama3", temperature=0.0)
-    # Using nomic-embed-text for fast, local RAGAS Answer Relevancy math
-    local_embeddings = OllamaEmbeddings(model="nomic-embed-text")
-    
-    # Wrap for RAGAS compatibility — evaluate() expects BaseRagasLLM / BaseRagasEmbeddings
+
+    # Wrap LLM for RAGAS compatibility — evaluate() expects BaseRagasLLM
     ragas_llm = LangchainLLMWrapper(local_judge_llm)
-    ragas_embeddings = LangchainEmbeddingsWrapper(local_embeddings)
+
+    # Use local HuggingFace embeddings instead of OllamaEmbeddings.
+    # Root cause of answer_relevancy=all NaN: OllamaEmbeddings makes HTTP calls to
+    # localhost:11434/api/embeddings. Ollama serialises ALL requests (LLM + embeddings)
+    # in a single queue, so embedding calls issued during RAGAS evaluation queue behind
+    # active LLM inference jobs and time out → NaN in every row.
+    # RagasHFEmbeddings runs via SentenceTransformer in-process (no HTTP), eliminating
+    # Ollama queue contention. Nomic requires trust_remote_code for its custom pooling.
+    ragas_embeddings = RagasHFEmbeddings(
+        model="nomic-ai/nomic-embed-text-v1.5",
+        device="cpu",
+        normalize_embeddings=True,
+        trust_remote_code=True,
+    )
     
     # --- CUSTOM METRICS: ALCE EVALUATION ---
     logging.info("Calculating ALCE Citation Precision & Recall (Local NLI checks)...")
