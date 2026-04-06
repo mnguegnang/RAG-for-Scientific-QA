@@ -128,6 +128,20 @@ class ScientificRAGPipeline:
         logging.info("Stage 1: Fetching top 100 candidates via Hybrid Search (Dense + Sparse)...")
         broad_results = self.retriever.search(query, k=100, dense_query=dense_query, filter_paper_id=filter_paper_id)
 
+        if not broad_results and filter_paper_id:
+            # The paper-scoped filter returned 0 hits — the paper's chunks
+            # may be indexed under a different doc_id key.  Fall back to
+            # unfiltered search so the query still gets an answer rather
+            # than a hard error that produces 0-context rows in the dataset.
+            logging.warning(
+                "Stage 1: filter_paper_id='%s' returned 0 results; "
+                "retrying without paper filter (fallback).",
+                filter_paper_id,
+            )
+            broad_results = self.retriever.search(
+                query, k=100, dense_query=dense_query, filter_paper_id=None
+            )
+
         if not broad_results:
             return {
                 "answer": "Error: No documents found in the database.",

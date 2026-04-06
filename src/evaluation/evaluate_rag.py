@@ -159,7 +159,25 @@ def run_evaluation(input_csv: str = None, output_csv: str = None):
     # RAGAS receives the full top-10 reranked contexts, identical to what ALCE uses.
     # Giving RAGAS all 10 docs ensures ContextRecall can find every relevant chunk
     # and Faithfulness/ContextPrecision have the complete evidence set to grade against.
-    eval_dataset = Dataset.from_pandas(df)
+
+    # Rows with 0 retrieved contexts produce guaranteed NaN/0 for every RAGAS metric
+    # (they correspond to pipeline errors — "Error: No documents found in the database.").
+    # Exclude them so they do not drag down the reported averages; their ALCE scores
+    # (already computed as 0 above) remain in the saved CSV for transparency.
+    empty_ctx_mask = df["contexts"].apply(len) == 0
+    if empty_ctx_mask.sum() > 0:
+        logging.warning(
+            "Skipping %d/%d rows with empty contexts before RAGAS evaluation "
+            "(pipeline returned no documents for those queries). "
+            "These rows are included in the CSV with RAGAS columns set to NaN.",
+            empty_ctx_mask.sum(),
+            len(df),
+        )
+        df_ragas = df[~empty_ctx_mask].reset_index(drop=True)
+    else:
+        df_ragas = df
+
+    eval_dataset = Dataset.from_pandas(df_ragas)
     metrics = [ContextPrecision(), ContextRecall(), Faithfulness(), AnswerRelevancy()]
 
     # --- RunConfig tuned for a single local CPU Ollama instance ---
@@ -196,10 +214,20 @@ def run_evaluation(input_csv: str = None, output_csv: str = None):
         batch_size=1
     )
     
-    # Merge results — use concat by index since RAGAS 0.4.x drops original columns from result df
+    # Merge results — RAGAS was run only on df_ragas (non-empty-context rows).
+    # Re-insert metric scores back into the full df by original row position so
+    # 0-context rows remain present in the CSV (with NaN for all RAGAS columns).
     ragas_df = ragas_result.to_pandas().reset_index(drop=True)
-    base_df = df[['question', 'ground_truth', 'answer', 'alce_citation_precision', 'alce_citation_recall']].reset_index(drop=True)
-    final_df = pd.concat([base_df, ragas_df.drop(columns=[c for c in ['question', 'answer', 'ground_truth', 'contexts'] if c in ragas_df.columns], errors='ignore')], axis=1)
+    ragas_metric_cols = [
+        c for c in ragas_df.columns
+        if c not in {"question", "answer", "ground_truth", "contexts"}
+    ]
+    final_df = df.copy().reset_index(drop=True)
+    for col in ragas_metric_cols:
+        final_df[col] = float("nan")
+    non_empty_positions = list(df.index[~empty_ctx_mask])
+    for col in ragas_metric_cols:
+        final_df.loc[non_empty_positions, col] = ragas_df[col].values
     
     # Save Report
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
