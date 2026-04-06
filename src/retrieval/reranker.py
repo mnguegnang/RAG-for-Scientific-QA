@@ -1,5 +1,29 @@
 import logging
+import sys
+import types
 import torch
+
+# ── Compatibility shim for ragatouille 0.0.9.x + langchain >= 1.0 ───────────
+# ragatouille 0.0.9.post2 imports BaseDocumentCompressor from the pre-1.0 path
+# `langchain.retrievers.document_compressors.base`, which was removed in
+# langchain 1.0.  The class now lives in `langchain_core.documents.compressor`.
+# Injecting stub modules at the old path before the ragatouille import resolves
+# the ModuleNotFoundError without modifying any installed package files.
+try:
+    import langchain.retrievers  # noqa: F401 — already available, nothing to do
+except ModuleNotFoundError:
+    from langchain_core.documents.compressor import BaseDocumentCompressor
+    _stub_ret = types.ModuleType("langchain.retrievers")
+    _stub_dc = types.ModuleType("langchain.retrievers.document_compressors")
+    _stub_base = types.ModuleType("langchain.retrievers.document_compressors.base")
+    _stub_base.BaseDocumentCompressor = BaseDocumentCompressor
+    _stub_dc.base = _stub_base
+    _stub_ret.document_compressors = _stub_dc
+    sys.modules.setdefault("langchain.retrievers", _stub_ret)
+    sys.modules.setdefault("langchain.retrievers.document_compressors", _stub_dc)
+    sys.modules.setdefault("langchain.retrievers.document_compressors.base", _stub_base)
+# ─────────────────────────────────────────────────────────────────────────────
+
 from ragatouille import RAGPretrainedModel
 
 logger = logging.getLogger(__name__)

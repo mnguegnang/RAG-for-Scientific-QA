@@ -31,7 +31,9 @@ ragas==0.4.3
 # ColBERT v2 late-interaction reranker (Santhanam et al., 2022 — NAACL 2022)
 # Replaces sentence-transformers CrossEncoder for reranking.
 # Provides RAGPretrainedModel.rerank() with MaxSim scoring.
-ragatouille>=0.0.8
+ragatouille>=0.0.8,<0.0.10  # <0.0.10: 0.0.10 switches to PyLate backend; pin Stanford ColBERT backend
+                            # Note: ragatouille 0.0.9.x imports langchain.retrievers (removed in langchain 1.0).
+                            # src/retrieval/reranker.py injects a compatibility shim at import time.
 
 adapters==1.2.0
 
