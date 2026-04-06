@@ -20,6 +20,22 @@ from ragas.metrics import ContextPrecision, ContextRecall, Faithfulness, AnswerR
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import HuggingFaceEmbeddings as RagasHFEmbeddings
 
+# AnswerRelevancy calls embed_query() / embed_documents() (LangChain interface).
+# ragas.embeddings.HuggingFaceEmbeddings only has embed_text / embed_texts
+# (ragas-native BaseRagasEmbedding), causing AttributeError on every AR job.
+# This subclass bridges the gap.
+class _RagasHFEmbeddingsFixed(RagasHFEmbeddings):
+    """Drop-in replacement adding embed_query / embed_documents (LangChain interface)
+    required by ResponseRelevancy.calculate_similarity."""
+
+    def embed_query(self, text: str) -> list:
+        """Single-text embedding — delegates to embed_texts([text])."""
+        return self.embed_texts([text])[0]
+
+    def embed_documents(self, texts: list) -> list:
+        """Batch embedding — delegates to embed_texts(texts)."""
+        return self.embed_texts(texts)
+
 # Modern LangChain Core & Local Ollama Imports
 from langchain_core.messages import HumanMessage
 from langchain_ollama import ChatOllama
@@ -132,7 +148,7 @@ def run_evaluation(input_csv: str = None, output_csv: str = None):
     # active LLM inference jobs and time out → NaN in every row.
     # RagasHFEmbeddings runs via SentenceTransformer in-process (no HTTP), eliminating
     # Ollama queue contention. Nomic requires trust_remote_code for its custom pooling.
-    ragas_embeddings = RagasHFEmbeddings(
+    ragas_embeddings = _RagasHFEmbeddingsFixed(
         model="nomic-ai/nomic-embed-text-v1.5",
         device="cpu",
         normalize_embeddings=True,
