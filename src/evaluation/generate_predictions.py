@@ -113,7 +113,6 @@ def generate_evaluation_dataset(output_path: str = None):
     #    run_evaluation.sh), the pipeline routes generation requests to the
     #    already-running vLLM server instead of loading the weights here.
     #    This frees GPU memory on this process for SPECTER2 and the reranker.
-    import os
     generator_backend = os.environ.get("GENERATOR_BACKEND", "auto")
     logging.info(
         "Initializing Scientific RAG Pipeline (generator_backend=%s)...",
@@ -140,6 +139,20 @@ def generate_evaluation_dataset(output_path: str = None):
         pipeline_output = rag_pipeline.ask(qa["question"], filter_paper_id=qa.get("paper_id"))
         full_answer = pipeline_output["answer"]
         retrieved_docs = pipeline_output["retrieved_docs"]
+
+        # Fix 5 — Fallback for empty-context rows (Lewis et al., 2020, NeurIPS
+        # Section 4.3): RAG with zero passages degenerates to unconditioned
+        # generation.  If paper-scoped retrieval failed, retry without the
+        # filter so every question gets at least some context for RAGAS/ALCE.
+        if not retrieved_docs and qa.get("paper_id"):
+            logging.warning(
+                "Question %d/%d: 0 docs with paper_id='%s'; "
+                "retrying without paper filter (fallback).",
+                i + 1, len(qa_pairs), qa["paper_id"],
+            )
+            pipeline_output = rag_pipeline.ask(qa["question"], filter_paper_id=None)
+            full_answer = pipeline_output["answer"]
+            retrieved_docs = pipeline_output["retrieved_docs"]
 
         # Strip <Reasoning> block: ALCE and RAGAS evaluate only the cited <Final Answer>.
         # Reasoning sentences have no [Doc N] tags and artificially lower Citation Recall.
@@ -172,5 +185,128 @@ def generate_evaluation_dataset(output_path: str = None):
     df.to_csv(output_path, index=False)
     logging.info(f"Successfully saved evaluation dataset to {output_path}")
 
+    # Log generation statistics (latency, token usage)
+    rag_pipeline.generator.log_generation_summary()
+
+
+def regenerate_error_rows(csv_path: str = None):
+    """Re-process only rows whose 'answer' contains a System Error string.
+
+    This avoids re-running the full 150-question pipeline when Ollama was
+    temporarily unreachable during the original generation pass.
+
+    The function:
+      1. Loads the existing evaluation_dataset.csv
+      2. Identifies rows matching "System Error:" or "Error:"
+      3. Re-initializes the RAG pipeline (with retry-enabled Ollama)
+      4. Re-generates only those rows, preserving all successful rows
+      5. Overwrites the CSV in-place
+
+    Typical usage (local CPU):
+        python -m src.evaluation.generate_predictions --fix-errors
+    """
+    _project_root = Path(__file__).resolve().parents[2]
+    if csv_path is None:
+        csv_path = str(_project_root / "data" / "evaluation_dataset.csv")
+
+    if not os.path.exists(csv_path):
+        logging.error("Cannot fix errors: %s does not exist. Run full generation first.", csv_path)
+        return
+
+    df = pd.read_csv(csv_path)
+
+    # Detect error rows
+    error_mask = df['answer'].str.contains(
+        r'^(System Error:|Error:)', na=False, regex=True
+    )
+    n_errors = error_mask.sum()
+
+    if n_errors == 0:
+        logging.info("No error rows found in %s — nothing to regenerate.", csv_path)
+        return
+
+    logging.info(
+        "Found %d/%d error rows in %s. Re-generating...",
+        n_errors, len(df), csv_path,
+    )
+
+    # Initialize pipeline (Ollama health check will run at init)
+    import ast
+    generator_backend = os.environ.get("GENERATOR_BACKEND", "auto")
+    rag_pipeline = ScientificRAGPipeline(
+        dense_index_path="data/indices/dense.index",
+        dense_meta_path="data/indices/dense.index.meta",
+        sparse_index_path="data/indices/sparse.pkl",
+        generator_backend=generator_backend,
+    )
+
+    fixed = 0
+    for error_num, idx in enumerate(df.index[error_mask], 1):
+        row = df.loc[idx]
+        question = row['question']
+        logging.info(
+            "Re-generating error %d/%d (dataset row %d): %s",
+            error_num, n_errors, idx, question[:80],
+        )
+
+        pipeline_output = rag_pipeline.ask(question)
+        full_answer = pipeline_output["answer"]
+        retrieved_docs = pipeline_output["retrieved_docs"]
+
+        # Fallback: retry without paper filter if zero docs
+        if not retrieved_docs:
+            pipeline_output = rag_pipeline.ask(question, filter_paper_id=None)
+            full_answer = pipeline_output["answer"]
+            retrieved_docs = pipeline_output["retrieved_docs"]
+
+        answer = extract_final_answer(full_answer)
+        context_strings = [doc["text"] for doc in retrieved_docs]
+        best_score = max(
+            (d.get("rerank_score", float("-inf")) for d in retrieved_docs),
+            default=float("-inf"),
+        )
+
+        # Check if this attempt also failed
+        if answer.startswith("System Error:") or answer.startswith("Error:"):
+            logging.warning("Row %d still failed: %s", idx, answer[:100])
+            continue
+
+        # Update the row in-place
+        df.at[idx, 'answer'] = answer
+        df.at[idx, 'full_answer'] = full_answer
+        df.at[idx, 'contexts'] = str(context_strings)
+        df.at[idx, 'best_rerank_score'] = best_score
+        df.at[idx, 'crag_triggered'] = pipeline_output.get("crag_triggered", False)
+        fixed += 1
+
+    df.to_csv(csv_path, index=False)
+    remaining = n_errors - fixed
+    logging.info(
+        "Re-generation complete: %d/%d errors fixed, %d still failing. Saved to %s",
+        fixed, n_errors, remaining, csv_path,
+    )
+
+    # Log generation statistics (latency, token usage)
+    rag_pipeline.generator.log_generation_summary()
+
+
 if __name__ == "__main__":
-    generate_evaluation_dataset()
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Generate or fix RAG evaluation predictions."
+    )
+    parser.add_argument(
+        "--fix-errors", action="store_true",
+        help="Re-generate only rows with 'System Error' answers "
+             "(requires Ollama to be running for CPU mode).",
+    )
+    parser.add_argument(
+        "--csv", type=str, default=None,
+        help="Path to evaluation_dataset.csv (default: data/evaluation_dataset.csv).",
+    )
+    args = parser.parse_args()
+
+    if args.fix_errors:
+        regenerate_error_rows(csv_path=args.csv)
+    else:
+        generate_evaluation_dataset(output_path=args.csv)

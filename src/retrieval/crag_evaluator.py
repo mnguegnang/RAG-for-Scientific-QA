@@ -34,6 +34,24 @@ from typing import List, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Minimal English stopwords for knowledge-strip filtering (Section 3.2).
+# Only content-word overlap should count toward relevance — function words
+# like "the", "is", "of" inflate overlap and let irrelevant strips survive.
+_STOPWORDS = frozenset({
+    'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+    'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare',
+    'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as',
+    'into', 'through', 'during', 'before', 'after', 'above', 'below',
+    'between', 'out', 'off', 'over', 'under', 'again', 'further', 'then',
+    'once', 'and', 'but', 'or', 'nor', 'not', 'so', 'yet', 'both',
+    'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no',
+    'only', 'own', 'same', 'than', 'too', 'very', 'just', 'because',
+    'about', 'up', 'that', 'this', 'these', 'those', 'it', 'its',
+    'what', 'which', 'who', 'whom', 'how', 'when', 'where', 'why',
+    'all', 'any', 'if', 'while', 'also',
+})
+
 
 class CRAGEvaluator:
     """
@@ -51,17 +69,17 @@ class CRAGEvaluator:
 
     def __init__(
         self,
-        correct_threshold: float = 20.0,
-        ambiguous_threshold: float = 12.0,
+        correct_threshold: float = 14.0,
+        ambiguous_threshold: float = 8.0,
         consistency_ratio: float = 0.3,
         min_strip_query_overlap: int = 2,
     ):
         """
         Args:
             correct_threshold: ColBERT MaxSim score at or above which a document
-                               is labeled 'Correct'. Default 20.0.
+                               is labeled 'Correct'. Default 14.0.
             ambiguous_threshold: Score between this and correct_threshold is labeled
-                                 'Ambiguous'. Below this is 'Incorrect'. Default 12.0.
+                                 'Ambiguous'. Below this is 'Incorrect'. Default 8.0.
             consistency_ratio: Minimum fraction of top-k documents labeled 'Correct'
                                for the overall CRAG action to be 'Correct'
                                (self-consistency signal). Default 0.3.
@@ -174,7 +192,7 @@ class CRAGEvaluator:
         by rerank score to avoid producing an empty context.
         """
         refined = []
-        query_terms = set(query.lower().split())
+        query_terms = set(query.lower().split()) - _STOPWORDS
 
         for doc in documents:
             label = doc.get('crag_label', 'Incorrect')
@@ -232,7 +250,7 @@ class CRAGEvaluator:
         """
         relevant = []
         for strip in strips:
-            strip_terms = set(strip.lower().split())
+            strip_terms = set(strip.lower().split()) - _STOPWORDS
             overlap = len(query_terms & strip_terms)
             if overlap >= self.min_strip_query_overlap:
                 relevant.append(strip)

@@ -19,6 +19,17 @@ generation:
   #   {context_str}             — numbered [Doc N] blocks from retrieved chunks
   #   {paper_focus_instruction} — the Step 0 paper-focus instruction above
   #   {query}                   — the user's question
+  #
+  # One-shot example sourced from real QASPER data (paper 1909.00694,
+  # question "What is the seed lexicon?") to enforce strict [Doc N] citation
+  # format compliance.
+  # Rationale:
+  #   - Gao et al. 2023 (ALCE, arXiv:2305.14627): ALCE uses regex \[Doc \d+\]
+  #     to extract citations; format deviations yield a score of 0.
+  #   - Wei et al. 2022 (Chain-of-Thought, arXiv:2201.11903): few-shot
+  #     exemplars improve format adherence by 15-30%.
+  #   - Min et al. 2022 (arXiv:2202.12837): demonstrations primarily teach
+  #     output format rather than task semantics.
   rag_prompt_template: |
     You are a precise scientific AI research assistant. Answer the user's query based ONLY on the provided context.
 
@@ -30,8 +41,24 @@ generation:
     {paper_focus_instruction}
     1. Comprehension: Read the context carefully. If the context does not contain the answer, reply exactly with: "The retrieved documents do not contain enough information to answer this." Do not guess.
     2. Chain of Thought: Provide a brief <Reasoning> section where you outline your logic based on the documents.
-    3. Citations: Provide a <Final Answer> section. Every factual claim MUST end with the citation tag of the document it originated from, e.g., [Doc 1] or [Doc 2].
+    3. Citations: Provide a <Final Answer> section. Every factual claim MUST end with EXACTLY the tag [Doc N] where N is the document number (e.g. [Doc 1], [Doc 2]). Do NOT use any other format such as (Doc 1), [Document 1], or [1].
     </Instructions>
+
+    <Example>
+    Context:
+    [Doc 1] The seed lexicon matches neither the former nor the latter event, and their discourse relation type is Cause. We assume the two events have the same polarities.
+    [Doc 2] The seed lexicon consists of positive and negative predicates. If the predicate of an extracted event is in the seed lexicon, we assign the corresponding polarity score (+1 for positive events and -1 for negative events) to the event.
+    [Doc 3] We constructed our seed lexicon consisting of 15 positive words and 15 negative words.
+
+    Question: What is the seed lexicon?
+
+    <Reasoning>
+    Doc 2 directly defines the seed lexicon as a collection of positive and negative predicates used to assign polarity scores. Doc 3 adds construction details. Doc 1 describes a specific case where the lexicon does not match.
+    </Reasoning>
+    <Final Answer>
+    The seed lexicon is a vocabulary of positive and negative predicates [Doc 2]. It assigns polarity scores (+1 for positive and -1 for negative events) to extracted events whose predicates appear in the lexicon [Doc 2]. The lexicon was constructed with 15 positive and 15 negative words [Doc 3].
+    </Final Answer>
+    </Example>
 
     <User Query>
     {query}

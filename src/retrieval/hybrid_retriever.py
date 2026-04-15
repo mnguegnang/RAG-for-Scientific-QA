@@ -1,4 +1,6 @@
 import faiss
+import hashlib
+import os
 import pickle
 import logging
 import numpy as np
@@ -9,6 +11,54 @@ from src.retrieval.sparse_store import tokenize_for_bm25
 
 logger = logging.getLogger(__name__)
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Project root for path-traversal checks
+_PROJECT_ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), '..', '..'))
+
+
+def _load_pickle_verified(path: str) -> object:
+    """Load a pickle file with path-traversal protection and SHA-256 integrity check.
+
+    Security rationale (OWASP A8 — Software and Data Integrity Failures):
+      pickle.load() can execute arbitrary code.  This wrapper adds two layers:
+        1. Path-traversal guard: rejects paths that resolve outside the project root.
+        2. SHA-256 sidecar verification: if ``<path>.sha256`` exists, the pickle
+           bytes are hashed and compared before deserialisation.
+
+    If no .sha256 sidecar is found the file is loaded with a logged warning
+    (backwards compatible with indices generated before this check was added).
+    """
+    resolved = os.path.realpath(path)
+    if not resolved.startswith(_PROJECT_ROOT + os.sep) and resolved != _PROJECT_ROOT:
+        raise ValueError(
+            f"Path traversal blocked: '{path}' resolves to '{resolved}' "
+            f"which is outside the project root '{_PROJECT_ROOT}'."
+        )
+
+    with open(resolved, 'rb') as fh:
+        raw = fh.read()
+
+    sha256_sidecar = resolved + ".sha256"
+    if os.path.exists(sha256_sidecar):
+        actual_hash = hashlib.sha256(raw).hexdigest()
+        with open(sha256_sidecar) as fh:
+            expected_hash = fh.read().strip()
+        if actual_hash != expected_hash:
+            raise ValueError(
+                f"Integrity check FAILED for {path}: "
+                f"expected sha256={expected_hash}, got {actual_hash}. "
+                "The file may have been tampered with or corrupted. "
+                "Re-run ingestion to regenerate indices."
+            )
+        logger.info("SHA-256 integrity check passed for %s", path)
+    else:
+        logger.warning(
+            "No .sha256 sidecar for %s — skipping integrity check. "
+            "Re-run ingestion to generate integrity files.", path,
+        )
+
+    return pickle.loads(raw)
+
 
 class HybridRetriever:
     def __init__(self, 
@@ -25,24 +75,22 @@ class HybridRetriever:
         logger.info("Loading FAISS Index from %s...", dense_index_path)
         self.dense_index = faiss.read_index(dense_index_path)
         
-        # 3. Load Metadata (To map FAISS IDs back to text)
-        with open(dense_meta_path, 'rb') as f:
-            self.dense_meta = pickle.load(f)
+        # 3. Load Metadata (To map FAISS IDs back to text) — verified pickle load
+        self.dense_meta = _load_pickle_verified(dense_meta_path)
             
-        # 4. Load Sparse Index (BM25)
+        # 4. Load Sparse Index (BM25) — verified pickle load
         logger.info("Loading BM25 Index from %s...", sparse_index_path)
-        with open(sparse_index_path, 'rb') as f:
-            self.bm25_package = pickle.load(f)
-            # The pickle contains the object and the corpus, we unpack it
-            self.bm25 = self.bm25_package['model']
-            # Extract Metadata it format. It was saved as: {'model': bm25, 'metadata': [...]}
-            # We need to separate the text and IDs for easy lookup during search
-            metadata_list = self.bm25_package['metadata']
+        self.bm25_package = _load_pickle_verified(sparse_index_path)
+        # The pickle contains the object and the corpus, we unpack it
+        self.bm25 = self.bm25_package['model']
+        # Extract Metadata it format. It was saved as: {'model': bm25, 'metadata': [...]}
+        # We need to separate the text and IDs for easy lookup during search
+        metadata_list = self.bm25_package['metadata']
 
-            self.bm25_corpus = [chunk['text'] for chunk in metadata_list] # The actual chunks
-            self.bm25_ids = [chunk['paper_id'] for chunk in metadata_list]
-            #self.bm25_corpus = self.bm25_package['metadata'] # The actual chunks
-            #self.bm25_ids = self.bm25_package['doc_ids'] # The IDs
+        self.bm25_corpus = [chunk['text'] for chunk in metadata_list] # The actual chunks
+        self.bm25_ids = [chunk['paper_id'] for chunk in metadata_list]
+        #self.bm25_corpus = self.bm25_package['metadata'] # The actual chunks
+        #self.bm25_ids = self.bm25_package['doc_ids'] # The IDs
             
     def _search_dense(self, query: str, k: int, dense_query: str = None):
         """Standard Vector Search.

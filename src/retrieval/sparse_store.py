@@ -1,5 +1,6 @@
 import re
 import os
+import hashlib
 import pickle
 import nltk
 from pathlib import Path
@@ -100,4 +101,9 @@ class SparseIndexer:
                 "model": self.bm25,
                 "metadata": self.corpus_chunks,
             }, f)
-        print(f"Saved sparse index to {self.index_path}")
+        # Write SHA-256 sidecar for integrity verification at load time
+        with open(self.index_path, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        with open(self.index_path + ".sha256", "w") as f:
+            f.write(sha)
+        print(f"Saved sparse index to {self.index_path} (sha256={sha[:16]}...)")

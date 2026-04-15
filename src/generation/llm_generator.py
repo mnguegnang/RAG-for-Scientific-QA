@@ -1,4 +1,5 @@
 import os
+import time
 import yaml
 import requests
 import logging
@@ -68,8 +69,20 @@ class LocalLLMGenerator:
         self.backend = backend
         self.api_url = api_url
 
+        # ── Generation statistics (GenAI §2 — cost/latency monitoring) ────────
+        self._stats = {
+            "total_calls": 0,
+            "total_latency_s": 0.0,
+            "total_prompt_tokens_approx": 0,
+            "total_completion_tokens_approx": 0,
+            "backend": None,  # filled below
+        }
+
         if self.backend == "ollama":
             self.model_name = ollama_model
+            self._ollama_max_retries = 5
+            self._ollama_base_wait = 2.0   # seconds; doubles each retry
+            self._verify_ollama_reachable()
             logging.info("[LLMGenerator] Using Ollama backend  | model: %s | endpoint: %s",
                          self.model_name, self.api_url)
 
@@ -93,6 +106,51 @@ class LocalLLMGenerator:
                 f"Unknown backend '{backend}'. "
                 "Choose 'auto', 'ollama', 'transformers', or 'vllm'."
             )
+
+        self._stats["backend"] = self.backend
+
+    # ── Ollama health check ───────────────────────────────────────────────────
+    def _verify_ollama_reachable(self):
+        """Fail-fast check that Ollama is reachable before processing begins.
+
+        Waits up to ~60 s with exponential backoff so Ollama has time to
+        cold-start (model loading can take 10-30 s on CPU).  If Ollama is
+        still unreachable after all attempts, raises ConnectionError with
+        an actionable message instead of silently poisoning 54/150 rows
+        with "System Error" strings.
+        """
+        # Ollama ≥0.1.29 exposes GET /api/tags (list loaded models).
+        # Older versions respond to any GET on the root with 200.
+        health_url = self.api_url.replace("/api/generate", "/api/tags")
+        max_attempts = 8
+        wait = 2.0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = requests.get(health_url, timeout=5)
+                if resp.status_code == 200:
+                    logging.info(
+                        "[Ollama] Health check passed on attempt %d/%d",
+                        attempt, max_attempts,
+                    )
+                    return
+                logging.warning(
+                    "[Ollama] Health check returned HTTP %d (attempt %d/%d)",
+                    resp.status_code, attempt, max_attempts,
+                )
+            except requests.exceptions.RequestException as exc:
+                logging.warning(
+                    "[Ollama] Health check failed (attempt %d/%d): %s",
+                    attempt, max_attempts, exc,
+                )
+            if attempt < max_attempts:
+                logging.info("[Ollama] Retrying in %.0f s...", wait)
+                time.sleep(wait)
+                wait = min(wait * 2, 30)
+        raise ConnectionError(
+            f"Ollama is not reachable at {health_url} after {max_attempts} "
+            "attempts (~60 s).  Start the server with 'ollama serve' before "
+            "running the pipeline, or set GENERATOR_BACKEND=vllm for GPU mode."
+        )
 
     # ── HuggingFace pipeline loader ───────────────────────────────────────────
     def _load_hf_pipeline(self):
@@ -179,22 +237,95 @@ class LocalLLMGenerator:
         """
         Generates an answer using the configured backend (Ollama or HuggingFace transformers).
         Routes automatically based on self.backend set at init time.
+
+        Tracks per-call latency and approximate token counts (GenAI §2).
         """
         if not retrieved_docs:
             return "No documents were retrieved. Cannot generate an answer."
 
         full_prompt = self._build_prompt(query, retrieved_docs)
 
+        # ── Latency + token tracking ─────────────────────────────────────────
+        # Approximate prompt tokens via whitespace split (±10% vs BPE for
+        # Llama 3 tokenizer).  Exact counting would require loading the
+        # tokenizer at init, which is unnecessary for observability.
+        prompt_tokens_approx = len(full_prompt.split())
+
+        t0 = time.time()
         if self.backend == "ollama":
-            return self._generate_ollama(full_prompt)
+            answer = self._generate_ollama(full_prompt)
         elif self.backend == "vllm":
-            return self._generate_vllm(full_prompt)
+            answer = self._generate_vllm(full_prompt)
         else:
-            return self._generate_transformers(full_prompt)
+            answer = self._generate_transformers(full_prompt)
+        elapsed = time.time() - t0
+
+        completion_tokens_approx = len(answer.split())
+
+        # Update cumulative stats
+        self._stats["total_calls"] += 1
+        self._stats["total_latency_s"] += elapsed
+        self._stats["total_prompt_tokens_approx"] += prompt_tokens_approx
+        self._stats["total_completion_tokens_approx"] += completion_tokens_approx
+
+        logging.info(
+            "[LLMGenerator] call=%d | backend=%s | latency=%.1fs | "
+            "prompt_tok≈%d | completion_tok≈%d | cumulative_latency=%.1fs",
+            self._stats["total_calls"], self.backend, elapsed,
+            prompt_tokens_approx, completion_tokens_approx,
+            self._stats["total_latency_s"],
+        )
+        return answer
+
+    def log_generation_summary(self) -> Dict[str, Any]:
+        """Log and return cumulative generation statistics.
+
+        Call this after the evaluation run completes to get a summary of
+        total latency, token usage, and per-call averages.  Useful for
+        cost estimation and performance budgeting (GenAI §2).
+        """
+        s = self._stats
+        n = s["total_calls"] or 1  # avoid division by zero
+        summary = {
+            "backend": s["backend"],
+            "total_calls": s["total_calls"],
+            "total_latency_s": round(s["total_latency_s"], 2),
+            "avg_latency_s": round(s["total_latency_s"] / n, 2),
+            "total_prompt_tokens_approx": s["total_prompt_tokens_approx"],
+            "total_completion_tokens_approx": s["total_completion_tokens_approx"],
+            "total_tokens_approx": (
+                s["total_prompt_tokens_approx"] + s["total_completion_tokens_approx"]
+            ),
+        }
+        logging.info(
+            "[LLMGenerator] === Generation Summary ===\n"
+            "  Backend:              %s\n"
+            "  Total calls:          %d\n"
+            "  Total latency:        %.1f s (avg %.1f s/call)\n"
+            "  Prompt tokens (≈):    %d\n"
+            "  Completion tokens (≈):%d\n"
+            "  Total tokens (≈):     %d",
+            summary["backend"], summary["total_calls"],
+            summary["total_latency_s"], summary["avg_latency_s"],
+            summary["total_prompt_tokens_approx"],
+            summary["total_completion_tokens_approx"],
+            summary["total_tokens_approx"],
+        )
+        return summary
 
     # ── Ollama backend ────────────────────────────────────────────────────────
     def _generate_ollama(self, full_prompt: str) -> str:
-        """Calls the local Ollama HTTP API and streams tokens to stdout."""
+        """Calls the local Ollama HTTP API with retry + exponential backoff.
+
+        Ollama on CPU is prone to transient failures:
+          - Cold model loading (10-30 s for 8B params on CPU)
+          - GC pauses under memory pressure
+          - Connection refused if 'ollama serve' was restarted mid-run
+
+        Without retries the original code immediately returned a permanent
+        "System Error" string, which poisoned 54/150 rows in the evaluation
+        dataset.  Retrying with backoff recovers from all transient modes.
+        """
         payload = {
             "model": self.model_name,
             "prompt": full_prompt,
@@ -203,44 +334,68 @@ class LocalLLMGenerator:
                 "temperature": 0.1  # Low temperature reduces hallucination
             }
         }
-        try:
-            logging.info("[Ollama] Sending prompt to %s. Awaiting stream...", self.api_url)
-            response = requests.post(self.api_url, json=payload, stream=True, timeout=300)
-            response.raise_for_status()
 
-            print("\n" + "="*40 + " LLM OUTPUT (Ollama) " + "="*40 + "\n")
+        last_exc = None
+        wait = self._ollama_base_wait
 
-            full_response = ""
-            char_count = 0
-            for line in response.iter_lines():
-                if line:
-                    body = json.loads(line.decode("utf-8"))
-                    token = body.get("response", "")
-                    full_response += token
-                    # Text wrapping at 80 chars
-                    if token == "\n":
-                        char_count = 0
-                        sys.stdout.write(token)
-                    else:
-                        char_count += len(token)
-                        if char_count >= 80 and token.startswith(" "):
-                            sys.stdout.write("\n" + token.lstrip())
-                            char_count = len(token.lstrip())
-                        else:
+        for attempt in range(1, self._ollama_max_retries + 1):
+            try:
+                logging.info(
+                    "[Ollama] Attempt %d/%d — sending prompt to %s",
+                    attempt, self._ollama_max_retries, self.api_url,
+                )
+                response = requests.post(
+                    self.api_url, json=payload, stream=True, timeout=300,
+                )
+                response.raise_for_status()
+
+                print("\n" + "="*40 + " LLM OUTPUT (Ollama) " + "="*40 + "\n")
+
+                full_response = ""
+                char_count = 0
+                for line in response.iter_lines():
+                    if line:
+                        body = json.loads(line.decode("utf-8"))
+                        token = body.get("response", "")
+                        full_response += token
+                        # Text wrapping at 80 chars
+                        if token == "\n":
+                            char_count = 0
                             sys.stdout.write(token)
-                    sys.stdout.flush()
-                    if body.get("done"):
-                        break
+                        else:
+                            char_count += len(token)
+                            if char_count >= 80 and token.startswith(" "):
+                                sys.stdout.write("\n" + token.lstrip())
+                                char_count = len(token.lstrip())
+                            else:
+                                sys.stdout.write(token)
+                        sys.stdout.flush()
+                        if body.get("done"):
+                            break
 
-            print("\n\n" + "="*92 + "\n")
-            return full_response
+                print("\n\n" + "="*92 + "\n")
+                return full_response
 
-        except json.JSONDecodeError as e:
-            logging.error("[Ollama] Failed to parse stream: %s", e)
-            return "System Error: JSON Parsing Failure."
-        except requests.exceptions.RequestException as e:
-            logging.error("[Ollama] Connection failed: %s", e)
-            return f"System Error: Could not connect to Ollama at {self.api_url}. Is 'ollama serve' running?"
+            except (requests.exceptions.RequestException, json.JSONDecodeError) as exc:
+                last_exc = exc
+                logging.warning(
+                    "[Ollama] Attempt %d/%d failed: %s",
+                    attempt, self._ollama_max_retries, exc,
+                )
+                if attempt < self._ollama_max_retries:
+                    logging.info("[Ollama] Retrying in %.0f s...", wait)
+                    time.sleep(wait)
+                    wait = min(wait * 2, 60)
+
+        # All retries exhausted
+        logging.error(
+            "[Ollama] All %d attempts failed. Last error: %s",
+            self._ollama_max_retries, last_exc,
+        )
+        return (
+            f"System Error: Could not connect to Ollama at {self.api_url} "
+            f"after {self._ollama_max_retries} retries. Is 'ollama serve' running?"
+        )
 
     # ── vLLM backend (OpenAI-compatible server) ──────────────────────────────────
     def _generate_vllm(self, full_prompt: str) -> str:

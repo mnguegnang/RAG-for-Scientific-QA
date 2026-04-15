@@ -1,4 +1,5 @@
 import faiss
+import hashlib
 import numpy as np
 import pickle
 import torch
@@ -16,7 +17,6 @@ class DenseIndexer:
     def __init__(self, index_path=_DEFAULT_DENSE_INDEX):
         # SPECTER2: scientifically pre-trained encoder (Singh et al., 2022, SciRepEval)
         # Dimension 768 vs. 384 for bge-small — richer representation for scientific text
-<<<<<<< HEAD
         
         # Optimization: Use mixed precision (FP16) on GPU to accelerate the forward 
         # pass and save VRAM when embedding thousands of QASPER chunks.
@@ -26,17 +26,6 @@ class DenseIndexer:
             device=device, 
             model_kwargs=model_kwargs  # Pass to the underlying transformer
         )
-=======
-        
-        # Optimization: Use mixed precision (FP16) on GPU to accelerate the forward 
-        # pass and save VRAM when embedding thousands of QASPER chunks.
-        model_kwargs = {"torch_dtype": torch.float16} if device == "cuda" else {}
-        
-        self.model = Specter2Encoder(
-            device=device, 
-            model_kwargs=model_kwargs  # Pass to the underlying transformer
-        )
->>>>>>> cc6e01ad33bfbf2fa9000592545c986b7eeb4561
         self.index_path = index_path
         self.dimension = Specter2Encoder.DIMENSION  # 768
         self.index = None
@@ -86,7 +75,13 @@ class DenseIndexer:
         faiss.write_index(self.index, self.index_path)
         
         # Save the metadata (the text and QASPER IDs) using pickle
-        with open(self.index_path + ".meta", "wb") as f:
+        meta_path = self.index_path + ".meta"
+        with open(meta_path, "wb") as f:
             pickle.dump(self.metadata_store, f)
+        # Write SHA-256 sidecar for integrity verification at load time
+        with open(meta_path, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        with open(meta_path + ".sha256", "w") as f:
+            f.write(sha)
         print(f"Saved dense index to {self.index_path}")
-        print(f"Saved metadata to {self.index_path}.meta")
+        print(f"Saved metadata to {meta_path} (sha256={sha[:16]}...)")
