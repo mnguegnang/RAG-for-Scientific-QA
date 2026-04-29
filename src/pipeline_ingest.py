@@ -15,11 +15,7 @@ def run_ingestion_pipeline():
     # 1. Load Data
     raw_data = load_and_inspect_qasper()
     
-<<<<<<< HEAD
     # We load the whole train  len(raw_data) = 1585 papers
-=======
-    # We load the whole train  len(raw_data) = 1585 papers
->>>>>>> cc6e01ad33bfbf2fa9000592545c986b7eeb4561
     subset_data = [raw_data[i] for i in range(len(raw_data))] 
     print(f"Processing subset of {len(subset_data)} papers.")
     

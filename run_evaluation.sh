@@ -1,31 +1,51 @@
 #!/bin/bash
+# ============================================================
+# Evaluation pipeline — Generation (Llama) + Evaluation (Prometheus 2)
+#
+# Two-phase GPU strategy:
+#   Phase 1 — RAG prediction generation
+#     vLLM: meta-llama/Llama-3.1-8B-Instruct  (port 8000)
+#     RAG:  SPECTER2 + ColBERT v2 reranker
+#   Phase 2 — Prometheus 2 evaluation (Kim et al. 2024, arXiv:2405.01535)
+#     Llama vLLM is stopped first (frees VRAM on small GPUs like RTX 4090)
+#     vLLM: prometheus-eval/prometheus-7b-v2.0 (port 8001)
+#
+# GPU / CPU auto-selection:
+#   N_GPU >= 2 : tensor-parallel across N-1 GPUs for vLLM; last GPU for RAG
+#   N_GPU == 1 : single GPU; vLLM uses 60% VRAM for generation, 80% for eval
+#   N_GPU == 0 : CPU-only; generation via Ollama; evaluation via Ollama+llama3
+#
+# Supported environments:
+#   RunPod  RTX 4090 (24 GB VRAM)  — single-GPU mode
+#   SLURM   A100-SXM4-80GB         — multi-GPU mode
+#
+# Usage:
+#   # SLURM:
+#   sbatch run_evaluation.sh
+#   # Interactive / RunPod terminal:
+#   bash run_evaluation.sh
+# ============================================================
 #SBATCH --job-name=rag_eval
 #SBATCH --output=logs/eval_%j.log
 #SBATCH --error=logs/eval_error_%j.log
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=40G
-#SBATCH --time=07:00:00
+#SBATCH --time=09:00:00
 
-set -e  # Exit immediately on any error
+set -e
 
 echo "Starting Evaluation Job on Node: ${HOSTNAME}"
 
 # ============================================================
 # ENVIRONMENT
 # ============================================================
-source ~/miniconda3/bin/activate
+source ~/miniconda3/bin/activate 2>/dev/null || true
 conda activate qasper-rag
 
 # ============================================================
 # PROJECT ROOT — SLURM-safe detection
 # ============================================================
-# Same logic as run_pipeline_ingest.sh: use SLURM_SUBMIT_DIR in SLURM jobs,
-# fall back to script location for interactive use.
-#
-# IMPORTANT: always submit from the project root:
-#   cd /home/math/nguegnang/RAG_project/qasper-rag-scientific-qa
-#   sbatch run_evaluation.sh
 if [ -n "${SLURM_SUBMIT_DIR}" ]; then
     PROJECT_ROOT="${SLURM_SUBMIT_DIR}"
 else
@@ -35,57 +55,35 @@ cd "${PROJECT_ROOT}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
 
 # ============================================================
-# VARIABLES
+# HuggingFace token
 # ============================================================
-# ── HuggingFace authentication ──────────────────────────────────────────────
-# Required for gated models such as meta-llama/Llama-3.1-8B-Instruct.
-# Set HF_TOKEN in ONE of these ways (most secure first):
-#   1. Before submitting: export HF_TOKEN="hf_XXXX"  (shell variable)
-#   2. Persistent:        echo "HF_TOKEN=hf_XXXX" >> ~/.bashrc
-#   3. Direct edit below (least secure — avoid committing the token):
-#      export HF_TOKEN="hf_XXXX"
 if [ -z "${HF_TOKEN}" ]; then
     echo "ERROR: HF_TOKEN is not set."
-    echo "       Please export HF_TOKEN=hf_XXXX before submitting this job."
-    echo "       The model meta-llama/Llama-3.1-8B-Instruct requires it."
+    echo "       export HF_TOKEN=hf_XXXX before running this script."
     exit 1
 fi
-# vLLM reads HUGGING_FACE_HUB_TOKEN; HuggingFace CLI / transformers read HF_TOKEN.
-# Exporting both ensures every downstream tool is authenticated.
 export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 
-# Quick gated-access pre-flight: verify the token has access to the model
-# before starting vLLM, so we fail in seconds rather than 15 minutes.
 check_hf_access() {
     local model_id="$1"
     local url="https://huggingface.co/${model_id}/resolve/main/config.json"
     local http_code
-    # NOTE: do NOT use -f here.  curl -f exits non-zero on HTTP 4xx, which
-    # triggers the "|| echo 000" fallback — but %{http_code} has already been
-    # written to stdout, so both get concatenated (e.g. "401" + "000" = "401000").
-    # Using -s only keeps stderr silent while still capturing the real status code.
     http_code=$(curl -s -o /dev/null -w "%{http_code}" \
         -H "Authorization: Bearer ${HF_TOKEN}" "${url}" 2>/dev/null)
-    # Empty output means curl itself failed (network unreachable, DNS error, etc.)
     [ -z "${http_code}" ] && http_code="000"
     if [ "${http_code}" != "200" ]; then
-        echo "ERROR: HuggingFace token does not have access to '${model_id}'."
-        echo "       HTTP status: ${http_code}"
-        if [ "${http_code}" = "401" ]; then
-            echo "       Token is missing or expired — please refresh your HF_TOKEN."
-        elif [ "${http_code}" = "403" ]; then
-            echo "       Token is valid but lacks model permission."
-            echo "       Request access at https://huggingface.co/${model_id}"
-        elif [ "${http_code}" = "000" ]; then
-            echo "       Could not reach huggingface.co — check network/proxy settings."
-        fi
+        echo "ERROR: HuggingFace access check failed for '${model_id}' (HTTP ${http_code})."
+        [ "${http_code}" = "401" ] && echo "       Token missing or expired."
+        [ "${http_code}" = "403" ] && echo "       Token lacks model permission. Request access at https://huggingface.co/${model_id}"
+        [ "${http_code}" = "000" ] && echo "       Network unreachable."
         exit 1
     fi
-    echo "HuggingFace access confirmed for '${model_id}' (HTTP ${http_code})"
+    echo "HuggingFace access confirmed: ${model_id} (HTTP ${http_code})"
 }
-# Choose HuggingFace cache: prefer /scratch if it has >=20 GB free,
-# otherwise fall back to ~/.cache/huggingface (home directory).
-_REQUIRED_GB=20
+
+# HuggingFace cache — prefer /scratch if >= 30 GB free (both models together
+# need ~30 GB on disk: Llama 3.1-8B ≈ 16 GB + Prometheus 2-7B ≈ 14 GB).
+_REQUIRED_GB=30
 _SCRATCH_DIR="/scratch/${USER}"
 if [ -d "${_SCRATCH_DIR}" ]; then
     _FREE_KB=$(df -k "${_SCRATCH_DIR}" 2>/dev/null | awk 'NR==2 {print $4}')
@@ -98,11 +96,14 @@ if [ "${_FREE_GB}" -ge "${_REQUIRED_GB}" ]; then
     echo "HF cache    : ${HF_HOME} (${_FREE_GB} GB free on /scratch)"
 else
     export HF_HOME="${HOME}/.cache/huggingface"
-    echo "HF cache    : ${HF_HOME} (scratch only has ${_FREE_GB} GB free -- using home)"
+    echo "HF cache    : ${HF_HOME} (scratch has ${_FREE_GB} GB — using home)"
 fi
+
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+
+mkdir -p logs
 
 echo "========================================"
 echo "Job ID    : ${SLURM_JOB_ID:-interactive}"
@@ -111,120 +112,153 @@ echo "Project   : ${PROJECT_ROOT}"
 echo "Start     : $(date +%T)"
 echo "========================================"
 
-mkdir -p logs
-
 # ============================================================
-# GPU ASSIGNMENT — fully dynamic, no hardcoded count
+# GPU ASSIGNMENT
 # ============================================================
-# Detect how many GPUs are actually allocated to this job.
 N_GPU=$(python -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 0)
 echo "Available GPUs: ${N_GPU}"
 
+VLLM_PID=""
+PROMETHEUS_PID=""
+PROMETHEUS_PORT=8001
+
 if [ "${N_GPU}" -ge 2 ]; then
-    # Two or more GPUs:
-    #   - All GPUs except the last → vLLM (tensor-parallel)
-    #   - Last GPU → SPECTER2 + BGE reranker + nomic-embed (RAG pipeline)
-    #
-    # SLURM sets CUDA_VISIBLE_DEVICES to the allocated physical GPU IDs.
-    # We parse that list so we never assume logical indices 0,1,2.
     IFS="," read -ra _GPUS <<< "${CUDA_VISIBLE_DEVICES:-$(seq -s, 0 $((N_GPU - 1)))}"
     N_ALLOC=${#_GPUS[@]}
     RAG_GPU="${_GPUS[$((N_ALLOC - 1))]}"
-    # Build VLLM_GPUS = all elements except the last
     VLLM_GPUS=$(IFS=,; echo "${_GPUS[*]:0:$((N_ALLOC - 1))}")
     TP_SIZE=$((N_ALLOC - 1))
     USE_GPU=true
-    VLLM_MEM_UTIL="0.85"  # dedicated vLLM GPUs — full utilisation is safe
-    echo "GPU layout  : vLLM on [${VLLM_GPUS}] (tensor-parallel-size=${TP_SIZE})"
-    echo "              RAG/Eval on [${RAG_GPU}]"
+    # Generation: 85% VRAM (dedicated vLLM GPUs, no RAG models competing)
+    GEN_MEM_UTIL="0.85"
+    # Evaluation: 85% VRAM (RAG models are no longer running)
+    EVAL_MEM_UTIL="0.85"
     GENERATOR_BACKEND_VALUE=vllm
+    echo "GPU layout  : vLLM on [${VLLM_GPUS}] (TP=${TP_SIZE}) | RAG/Eval on [${RAG_GPU}]"
 
 elif [ "${N_GPU}" -eq 1 ]; then
-    # Single GPU: run everything on it.
-    # vLLM and RAG share the one GPU; tensor-parallel-size must be 1.
     RAG_GPU="${CUDA_VISIBLE_DEVICES:-0}"
     VLLM_GPUS="${RAG_GPU}"
     TP_SIZE=1
     USE_GPU=true
-    VLLM_MEM_UTIL="0.50"  # shared GPU — keep 50% VRAM for SPECTER2/BGE/Nomic
-    echo "GPU layout  : single GPU [${RAG_GPU}] for vLLM + RAG/Eval"
+    # Generation: 60% VRAM — leaves headroom for SPECTER2 + ColBERT on same GPU.
+    # RTX 4090 (24 GB): 60% = 14.4 GB for Llama 3.1-8B, ~9 GB for RAG models.
+    GEN_MEM_UTIL="0.60"
+    # Evaluation: 80% VRAM — SPECTER2/ColBERT are done; Prometheus 2-7B ≈ 14 GB.
+    EVAL_MEM_UTIL="0.80"
     GENERATOR_BACKEND_VALUE=vllm
+    echo "GPU layout  : single GPU [${RAG_GPU}] (RTX 4090 / A100 single-GPU mode)"
 
 else
-    # CPU-only mode: skip vLLM entirely, fall back to Ollama for generation.
     USE_GPU=false
     RAG_GPU=""
     GENERATOR_BACKEND_VALUE=ollama
-    echo "No GPU detected — running in CPU/Ollama mode"
-    echo "Make sure 'ollama serve' is running before this step."
+    echo "No GPU detected — CPU/Ollama mode."
+    echo "Ensure 'ollama serve' is running and 'llama3' model is pulled."
 fi
 
+# Helper — wait for an HTTP server to become ready
+wait_for_server() {
+    local port="$1"
+    local label="$2"
+    local max_wait="${3:-600}"
+    local elapsed=0
+    local pid_var="${4:-}"
+
+    until curl -sf "http://localhost:${port}/health" > /dev/null 2>&1; do
+        if [ -n "${pid_var}" ]; then
+            local pid="${!pid_var}"
+            if ! kill -0 "${pid}" 2>/dev/null; then
+                echo "ERROR: ${label} server (PID ${pid}) exited unexpectedly."
+                exit 1
+            fi
+        fi
+        if [ "${elapsed}" -ge "${max_wait}" ]; then
+            echo "ERROR: ${label} server did not become ready within ${max_wait}s."
+            [ -n "${pid_var}" ] && kill "${!pid_var}" 2>/dev/null || true
+            exit 1
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+        echo "  ...${label} not ready yet (${elapsed}s)"
+    done
+    echo "${label} server ready on port ${port}."
+}
+
 # ============================================================
-# 2. Start the vLLM server (GPU mode only)
+# PHASE 1 — Start Llama vLLM server (generation)
 # ============================================================
-VLLM_PID=""
 if [ "${USE_GPU}" = true ]; then
-    # Verify token access before spending time downloading — fail fast.
     check_hf_access "meta-llama/Llama-3.1-8B-Instruct"
 
-    echo "Starting vLLM server (tensor-parallel-size=${TP_SIZE} on GPUs [${VLLM_GPUS}])..."
+    echo "Starting Llama 3.1-8B vLLM server (port 8000, TP=${TP_SIZE})..."
     CUDA_VISIBLE_DEVICES="${VLLM_GPUS}" \
     python -m vllm.entrypoints.openai.api_server \
         --model meta-llama/Llama-3.1-8B-Instruct \
         --dtype auto \
         --port 8000 \
         --tensor-parallel-size "${TP_SIZE}" \
-        --gpu-memory-utilization "${VLLM_MEM_UTIL}" \
+        --gpu-memory-utilization "${GEN_MEM_UTIL}" \
         --max-model-len 8192 \
         --disable-custom-all-reduce \
         --hf-token "${HF_TOKEN}" &
     VLLM_PID=$!
 
-    # 3. Wait for vLLM to become ready
-    echo "Waiting for vLLM server to be ready..."
-    MAX_WAIT=900
-    ELAPSED=0
-    until curl -sf http://localhost:8000/health > /dev/null 2>&1; do
-        # Abort immediately if vLLM exited (e.g. OOM, disk full, auth error)
-        if ! kill -0 "${VLLM_PID}" 2>/dev/null; then
-            echo "ERROR: vLLM server process exited unexpectedly. Check logs above."
-            exit 1
-        fi
-        if [ "${ELAPSED}" -ge "${MAX_WAIT}" ]; then
-            echo "ERROR: vLLM did not become ready within ${MAX_WAIT}s. Aborting."
-            kill "${VLLM_PID}" 2>/dev/null
-            exit 1
-        fi
-        sleep 5
-        ELAPSED=$((ELAPSED + 5))
-        echo "  ...still waiting (${ELAPSED}s elapsed)"
-    done
-    echo "vLLM server is ready."
+    wait_for_server 8000 "Llama 3.1-8B" 900 VLLM_PID
 fi
 
 # ============================================================
-# 4. Generate RAG predictions
+# PHASE 2 — Generate RAG predictions
 # ============================================================
-# CUDA_VISIBLE_DEVICES restricts this process to the RAG GPU (or unset on CPU).
-# GENERATOR_BACKEND routes LLM calls to vLLM server (GPU) or Ollama (CPU).
 echo "Generating RAG predictions (backend=${GENERATOR_BACKEND_VALUE})..."
 CUDA_VISIBLE_DEVICES="${RAG_GPU}" \
 GENERATOR_BACKEND="${GENERATOR_BACKEND_VALUE}" \
 python -m src.evaluation.generate_predictions
 
 # ============================================================
-# 5. Run RAGAS + ALCE evaluation
+# PHASE 3 — Stop Llama, start Prometheus 2 vLLM (evaluation)
 # ============================================================
-echo "Starting RAGAS Evaluation (backend=${GENERATOR_BACKEND_VALUE})..."
+if [ "${USE_GPU}" = true ]; then
+    echo "Stopping Llama vLLM (PID ${VLLM_PID}) before starting Prometheus 2..."
+    kill "${VLLM_PID}" 2>/dev/null || true
+    wait "${VLLM_PID}" 2>/dev/null || true
+    VLLM_PID=""
+    sleep 5   # allow GPU VRAM to be fully released
+
+    # Prometheus 2 is not a gated model — no HF access check needed.
+    echo "Starting Prometheus 2 vLLM server (port ${PROMETHEUS_PORT}, TP=${TP_SIZE})..."
+    CUDA_VISIBLE_DEVICES="${VLLM_GPUS}" \
+    python -m vllm.entrypoints.openai.api_server \
+        --model prometheus-eval/prometheus-7b-v2.0 \
+        --dtype auto \
+        --port "${PROMETHEUS_PORT}" \
+        --tensor-parallel-size "${TP_SIZE}" \
+        --gpu-memory-utilization "${EVAL_MEM_UTIL}" \
+        --max-model-len 4096 \
+        --hf-token "${HF_TOKEN}" &
+    PROMETHEUS_PID=$!
+
+    wait_for_server "${PROMETHEUS_PORT}" "Prometheus 2" 600 PROMETHEUS_PID
+fi
+
+# ============================================================
+# PHASE 4 — Run Prometheus 2 + ALCE evaluation
+# ============================================================
+echo "Running Prometheus 2 + ALCE evaluation..."
 CUDA_VISIBLE_DEVICES="${RAG_GPU}" \
+PROMETHEUS_PORT="${PROMETHEUS_PORT}" \
 python -m src.evaluation.evaluate_rag
 
 # ============================================================
 # CLEANUP
 # ============================================================
+if [ -n "${PROMETHEUS_PID}" ]; then
+    echo "Shutting down Prometheus 2 server (PID ${PROMETHEUS_PID})..."
+    kill "${PROMETHEUS_PID}" 2>/dev/null || true
+fi
 if [ -n "${VLLM_PID}" ]; then
-    echo "Shutting down vLLM server (PID ${VLLM_PID})..."
+    echo "Shutting down Llama vLLM server (PID ${VLLM_PID})..."
     kill "${VLLM_PID}" 2>/dev/null || true
 fi
 
-echo "Evaluation Complete!"
+echo "Evaluation Complete! — $(date +%T)"

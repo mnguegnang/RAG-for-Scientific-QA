@@ -19,14 +19,20 @@ ollama==0.6.1
 accelerate>=0.30.0  # Required for device_map="auto" in HuggingFace transformers (GPU backend)
 #fastapi==0.133.0
 langchain-ollama==1.0.1
-langchain-core==1.2.25       # required by langchain-ollama, ragas, and langchain-openai
+langchain-core==1.2.25       # required by langchain-ollama and langchain-openai
 langchain==1.2.14             # base langchain package
 langchain-openai==1.1.10      # ChatOpenAI / OpenAI embeddings (run_rag.py)
 langchain-community==0.4.1    # community integrations (loaders, tools)
 langchain-text-splitters==1.1.1  # document splitting utilities
 langchain-huggingface==1.2.1  # HuggingFaceEmbeddings (GPU evaluation)
-einops==0.8.2                 # required by nomic-ai/nomic-embed-text-v1.5
-ragas==0.4.3
+# einops==0.8.2               # was required by nomic-ai/nomic-embed-text-v1.5 (removed; replaced by Prometheus 2)
+# ragas==0.4.3                # replaced by Prometheus 2 LLM-as-judge evaluation (Kim et al. 2024, arXiv:2405.01535)
+
+# Prometheus 2 evaluation (Kim et al. 2024, arXiv:2405.01535)
+# Model: prometheus-eval/prometheus-7b-v2.0 (public HuggingFace model, no gated access)
+# Loaded via HuggingFace transformers (GPU) or served via vLLM; no extra pip package required.
+# vLLM server installation (GPU only — install separately, not via this requirements.txt):
+#   pip install vllm   OR   use a pre-built RunPod / SLURM container with vLLM
 
 # ColBERT v2 late-interaction reranker (Santhanam et al., 2022 — NAACL 2022)
 # Replaces sentence-transformers CrossEncoder for reranking.

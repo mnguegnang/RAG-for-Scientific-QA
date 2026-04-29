@@ -1,7 +1,7 @@
 """
 CRAG Threshold Calibration
 --------------------------
-Two calibration modes for the bge-reranker-v2-m3 CRAG gate in run_rag.py.
+Two calibration modes for the ColBERT v2 CRAG gate in run_rag.py.
 
 Mode 1 — "f1"  (default, when context_recall is available):
     Runs retrieval + reranking on the evaluation set, records each query’s
@@ -98,7 +98,7 @@ def _collect_reranker_scores(questions, dense_index, dense_meta,
     maximum bge-reranker-v2-m3 logit as a float array.
     """
     from src.retrieval.hybrid_retriever import HybridRetriever
-    from src.retrieval.reranker import Reranker
+    from src.retrieval.reranker import ColBERTv2Reranker
 
     logging.info("Loading HybridRetriever …")
     retriever = HybridRetriever(
@@ -106,8 +106,8 @@ def _collect_reranker_scores(questions, dense_index, dense_meta,
         dense_meta_path=dense_meta,
         sparse_index_path=sparse_index,
     )
-    logging.info("Loading Reranker …")
-    reranker = Reranker(model_name='BAAI/bge-reranker-v2-m3')
+    logging.info("Loading ColBERT v2 Reranker …")
+    reranker = ColBERTv2Reranker(model_name='colbert-ir/colbertv2.0')
 
     max_logits = []
     for i, query in enumerate(questions):
@@ -192,7 +192,7 @@ def _plot(scores: np.ndarray, labels: np.ndarray,
                 label=f'F1-max threshold = {best_threshold:.3f}')
     ax1.axvline(0.0, color='grey', linestyle=':', linewidth=1,
                 label='Default threshold (0.0)')
-    ax1.set_xlabel('Max Reranker Logit (bge-reranker-v2-m3)')
+    ax1.set_xlabel('Max Reranker Score (ColBERT v2 MaxSim)')
     ax1.set_ylabel('Count')
     ax1.set_title('CRAG Gate – Reranker Logit Distributions')
     ax1.legend()
@@ -332,7 +332,7 @@ def calibrate_percentile(dataset_csv: str, percentile: float,
                    label=f"{percentile}th pct threshold = {threshold:.3f}")
         ax.axvline(0.0, color="grey", linestyle=":", linewidth=1,
                    label="Default threshold (0.0)")
-        ax.set_xlabel("Max Reranker Logit (bge-reranker-v2-m3)")
+        ax.set_xlabel("Max Reranker Score (ColBERT v2 MaxSim)")
         ax.set_ylabel("Count")
         ax.set_title("CRAG Threshold — Score Distribution (percentile mode)")
         ax.legend()
