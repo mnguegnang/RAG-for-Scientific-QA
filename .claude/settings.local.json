@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(/teamspace/studios/this_studio/RAG-for-Scientific-QA/.venv/bin/python -c \"import sys; print\\(sys.executable, sys.version\\)\")",
-      "Bash(/teamspace/studios/this_studio/RAG-for-Scientific-QA/.venv/bin/python -c \"import datasets\")"
+      "Bash(/teamspace/studios/this_studio/RAG-for-Scientific-QA/.venv/bin/python -c \"import datasets\")",
+      "Bash(.venv/bin/python *)"
     ]
   }
 }
