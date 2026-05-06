@@ -72,7 +72,8 @@ class ScientificRAGPipeline:
     #                             "How big is the Japanese data?" (7 words).
     HYDE_QUERY_WORD_THRESHOLD: int = 10
 
-    def _generate_hyde_query(self, query: str) -> str:
+    def _generate_hyde_query(self, query: str,
+                             filter_paper_id: str = None) -> str:
         """
         Generates a hypothetical passage (HyDE) for dense retrieval.
 
@@ -80,11 +81,18 @@ class ScientificRAGPipeline:
         pre-trained on passage-level text, not question-style strings.
         Encoding a hypothetical answer passage instead closes this gap.
 
+        When *filter_paper_id* is provided, a scoping note is appended to the
+        HyDE prompt so the generated passage is semantically closer to the
+        target paper's vocabulary and style, improving retrieval precision on
+        paper-specific QASPER queries.
+
         Reference:
             Gao et al. (2022). Precise Zero-Shot Dense Retrieval without
             Relevance Labels (HyDE). arXiv:2212.10496. ACL 2023.
         """
-        return self.generator.generate_hypothetical_answer(query)
+        return self.generator.generate_hypothetical_answer(
+            query, filter_paper_id=filter_paper_id
+        )
 
     def ask(self, query: str, filter_paper_id: str = None) -> dict:
         """
@@ -112,7 +120,9 @@ class ScientificRAGPipeline:
                 query_word_count, self.HYDE_QUERY_WORD_THRESHOLD,
             )
             try:
-                dense_query = self._generate_hyde_query(query)
+                dense_query = self._generate_hyde_query(
+                    query, filter_paper_id=filter_paper_id
+                )
                 logging.info(
                     "HyDE passage generated (%d chars): %.80s...",
                     len(dense_query), dense_query,
@@ -187,7 +197,7 @@ class ScientificRAGPipeline:
                 top_docs,
                 key=lambda x: x.get('rerank_score', 0.0),
                 reverse=True,
-            )[:3]
+            )[:5]
             logging.warning(
                 "CRAG action=Incorrect: falling back to top-%d docs by rerank "
                 "score (graceful degradation instead of refusal).",

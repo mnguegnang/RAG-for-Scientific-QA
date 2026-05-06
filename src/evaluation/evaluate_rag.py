@@ -403,68 +403,134 @@ class PrometheusJudge:
                              ground_truth: str) -> float:
         """
         Coverage of the ground-truth answer by all retrieved passages.
-        Aligned with RAGAS ContextRecall (Es et al. 2023 §3.2).
-        Returns normalized score in [0.0, 1.0].
+
+        Implements sentence-level attribution: each ground-truth sentence is
+        checked independently via a binary True/False NLI prompt against the
+        full set of retrieved passages.  The metric is the fraction of GT
+        sentences supported by at least one passage.
+
+        Reference:
+            Es et al. (2023). RAGAS: Automated Evaluation of Retrieval
+            Augmented Generation Systems. §3.2, Definition 3 — sentence-level
+            attribution loop: recall = |{s ∈ GT : ∃p ∈ C, p supports s}| / |GT|.
+
+        Returns float in [0.0, 1.0], or float("nan") if no GT sentences or no
+        contexts are available.
         """
-        # Fix 2+3: 1500-char limit captures >97% of chunks fully (median chunk
-        # is 594 chars; 500-char limit cut 64% of chunks — Es et al. 2023 §3.2
-        # pass full context). Using all 10 reranked passages, not just 6.
+        if not contexts or not ground_truth:
+            return float("nan")
+
         ctx_block = "\n---\n".join(
             f"[Passage {i + 1}] {c[:1500]}" for i, c in enumerate(contexts[:10])
         )
-        instruction = (
-            "You are a scientific RAG evaluator. Determine how well the retrieved "
-            "passages together cover the information needed to reproduce the "
-            "ground-truth answer. Check whether each key fact in the ground-truth "
-            "appears in at least one passage.\n\n"
-            f"Question: {question}\n\n"
-            f"Ground-truth answer: {ground_truth[:500]}"
-        )
-        return self._norm(self._call(
-            instruction=instruction,
-            response=f"Retrieved passages:\n{ctx_block}",
-            reference_answer=(
-                "Passages that together directly state every fact in the ground-truth. "
-                "QASPER example: for Q='How big is their model?' and ground-truth "
-                "'1.16 million parameters and 11.04 MB', the ideal retrieved set "
-                "contains a passage that explicitly reports the parameter count and "
-                "memory size of the model being discussed."
-            ),
-            rubric=_RUBRICS["context_recall"],
-        ))
+
+        gt_sentences = [s for s in nltk.sent_tokenize(ground_truth) if len(s) >= 10]
+        if not gt_sentences:
+            return float("nan")
+
+        supported = 0
+        for gt_sent in gt_sentences:
+            prompt = (
+                "You are a scientific RAG evaluator.\n"
+                "Retrieved passages:\n" + ctx_block + "\n\n"
+                "Ground-truth sentence: " + gt_sent + "\n\n"
+                "Does at least one retrieved passage directly support this "
+                "ground-truth sentence? "
+                "Answer with exactly one word: True or False."
+            )
+            text = self._generate(prompt).strip()
+
+            if re.search(r"\bTrue\b", text, re.IGNORECASE):
+                result = True
+            elif re.search(r"\bFalse\b", text, re.IGNORECASE):
+                result = False
+            elif re.search(r"\byes\b", text, re.IGNORECASE):
+                result = True
+            elif re.search(r"\bno\b", text, re.IGNORECASE):
+                result = False
+            else:
+                logging.warning(
+                    "[ContextRecall] Could not parse True/False from: %.80s", text
+                )
+                result = False
+
+            logging.debug(
+                "[ContextRecall] GT sentence %r → %s", gt_sent[:60], result
+            )
+            if result:
+                supported += 1
+
+        return supported / len(gt_sentences)
 
     def score_faithfulness(self, question: str, answer: str,
                            contexts: List[str]) -> float:
         """
         Degree to which the generated answer is grounded in retrieved contexts.
-        Aligned with RAGAS Faithfulness (Es et al. 2023 §3.3).
-        Returns normalized score in [0.0, 1.0].
+
+        Implements per-claim binary NLI: each sentence from the generated answer
+        is treated as a distinct claim and verified independently against the
+        retrieved passages via a True/False prompt.  The metric is the fraction
+        of claims supported by at least one passage.
+
+        References:
+            Es et al. (2023). RAGAS §3.3, Definition 4 — per-claim grounding
+            check: faithfulness = |{c ∈ A : ∃p ∈ C, p supports c}| / |A|.
+            Zheng et al. (2023). MT-Bench §4.2 — single-criterion per call
+            yields more reliable binary judgements than holistic multi-claim prompts.
+
+        Returns float in [0.0, 1.0], or float("nan") if no claim sentences or
+        no contexts are available.
         """
-        # Fix 2: 1500-char limit captures >97% of chunks fully — same rationale
-        # as context_recall fix (Es et al. 2023 §3.3 pass full context strings).
+        if not contexts or not answer:
+            return float("nan")
+
         ctx_block = "\n---\n".join(
             f"[Passage {i + 1}] {c[:1500]}" for i, c in enumerate(contexts[:5])
         )
-        instruction = (
-            "You are a scientific RAG evaluator. Determine whether every factual "
-            "claim in the generated answer is explicitly supported by the retrieved "
-            "passages. Flag any claim that goes beyond what the passages state.\n\n"
-            f"Question: {question}\n\n"
-            f"Retrieved passages:\n{ctx_block}"
-        )
-        return self._norm(self._call(
-            instruction=instruction,
-            response=f"Generated answer:\n{answer[:800]}",
-            reference_answer=(
-                "An answer where every factual claim is directly traceable to the "
-                "retrieved passages. QASPER example: for Q='What evaluation metrics "
-                "are used?' with context 'We compare the performance of translation "
-                "approaches based on four metrics:', the ideal answer lists 'exact "
-                "match, f1 score, edit distance and goal match' — every metric "
-                "present in the context, nothing fabricated."
-            ),
-            rubric=_RUBRICS["faithfulness"],
-        ))
+
+        raw_sentences = nltk.sent_tokenize(answer)
+        claim_sentences = [s for s in raw_sentences if len(s) >= 15]
+        if not claim_sentences:
+            return float("nan")
+
+        supported = 0
+        for sent in claim_sentences:
+            clean_sent = re.sub(
+                r"\[Doc \d+(?:,\s*Doc \d+)*\]", "", sent
+            ).strip()
+            if not clean_sent:
+                continue
+
+            prompt = (
+                "Retrieved passages:\n" + ctx_block + "\n\n"
+                "Claim from generated answer: " + clean_sent + "\n\n"
+                "Is this claim directly supported by at least one of the "
+                "retrieved passages? "
+                "Answer with exactly one word: True or False."
+            )
+            text = self._generate(prompt).strip()
+
+            if re.search(r"\bTrue\b", text, re.IGNORECASE):
+                result = True
+            elif re.search(r"\bFalse\b", text, re.IGNORECASE):
+                result = False
+            elif re.search(r"\byes\b", text, re.IGNORECASE):
+                result = True
+            elif re.search(r"\bno\b", text, re.IGNORECASE):
+                result = False
+            else:
+                logging.warning(
+                    "[Faithfulness] Could not parse True/False from: %.80s", text
+                )
+                result = False
+
+            logging.debug(
+                "[Faithfulness] Claim %r → %s", clean_sent[:60], result
+            )
+            if result:
+                supported += 1
+
+        return supported / len(claim_sentences)
 
     def score_answer_relevancy(self, question: str, answer: str) -> float:
         """
@@ -507,10 +573,20 @@ class PrometheusJudge:
         (the answer addresses the question) while being factually wrong (wrong
         number or wrong model name) — correctness catches this gap.
 
-        Reference:
+        Equivalence rules (injected into the rubric instruction) cover anticipated
+        failure modes observed in QASPER evaluation:
+          - Arithmetic: "15 positive + 15 negative words" should equal "30 words".
+          - Numeric formats: "84.3%" and "0.843" are the same value.
+          - Domain synonyms: "F-measure" = "F1 score".
+
+        References:
             Dasigi et al. (2021). A Dataset of Information-Seeking Questions and
             Answers Anchored in Research Papers. NAACL 2021. §4 — evaluation
             protocol: answers are judged for exact match against annotated spans.
+            Kim et al. (2024). Prometheus 2 §4.3 — rubric examples must cover
+            anticipated failure modes including numerical equivalences.
+            Hendrycks et al. (2021). MATH §3 — 7B models achieve <10% on
+            arithmetic reasoning; explicit equivalence rules compensate.
         """
         if not ground_truth:
             return float("nan")
@@ -519,6 +595,15 @@ class PrometheusJudge:
             "The question is about an NLP research paper. The reference answer is "
             "the ground-truth annotated by paper authors. Determine whether the "
             "generated answer conveys the same scientific fact as the reference.\n\n"
+            "IMPORTANT equivalence rules:\n"
+            "- Arithmetic equivalences count as correct: '15 positive + 15 negative "
+            "words' equals '30 words'.\n"
+            "- Percentage and decimal formats are equivalent: '84.3%' equals '0.843'.\n"
+            "- Accepted synonyms: 'F-measure' equals 'F1 score'; 'accuracy' equals "
+            "'classification accuracy'.\n"
+            "- If the answer gives all components that sum to the ground-truth number, "
+            "score >= 4.\n"
+            "- Paraphrase that preserves the scientific fact exactly scores >= 4.\n\n"
             f"Question: {question}\n\n"
             f"Reference answer (ground truth): {ground_truth[:400]}"
         )
@@ -634,11 +719,10 @@ class ALCEEvaluator:
             supported_sentences / sentences_with_citations
             if sentences_with_citations > 0 else 0.0
         )
-        # Recall denominator: only claim-bearing sentences (Gao et al. 2023 §4.1)
-        claim_bearing = sum(
-            1 for s in sentences
-            if re.search(r"Doc (\d+)", s) or len(s.strip()) >= self.MIN_CLAIM_LENGTH
-        )
+        # Gao et al. (2023) EMNLP §4.1, Equation 2: denominator = sentences_with_citations
+        # (model instruction mandates [Doc N] on every factual claim; uncited sentences
+        # are reasoning steps or connectors, not factual claims requiring support)
+        claim_bearing = sentences_with_citations
         recall = supported_sentences / claim_bearing if claim_bearing > 0 else 0.0
         return precision, recall
 

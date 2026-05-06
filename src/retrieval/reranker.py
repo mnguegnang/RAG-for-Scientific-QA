@@ -61,7 +61,7 @@ class ColBERTv2Reranker:
         self.model = RAGPretrainedModel.from_pretrained(model_name)
         logger.info("ColBERT v2 reranker ready.")
 
-    def rerank(self, query: str, documents: list, top_k: int = 7) -> list:
+    def rerank(self, query: str, documents: list, top_k: int = 10) -> list:
         """
         Re-ranks documents using ColBERT v2 late-interaction scoring (MaxSim).
 

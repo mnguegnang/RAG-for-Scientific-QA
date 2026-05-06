@@ -27,7 +27,18 @@ var/
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
-*.spec
+*.spec========== PROMETHEUS 2 × QASPER EVALUATION REPORT ==========
+2026-05-06 03:28:09,163 - INFO - --- Retrieval metrics ---
+2026-05-06 03:28:09,164 - INFO - Context Precision:       0.6030  [12 refusal]
+2026-05-06 03:28:09,164 - INFO - Context Recall:          0.0643  [12 refusal, 2 timeout]
+2026-05-06 03:28:09,164 - INFO - --- Generation metrics ---
+2026-05-06 03:28:09,164 - INFO - Faithfulness:            0.3463  [12 refusal, 3 timeout]
+2026-05-06 03:28:09,164 - INFO - Answer Relevancy:        0.4728  [12 refusal]
+2026-05-06 03:28:09,165 - INFO - Answer Correctness:      0.2956  [12 refusal, 1 timeout]  [QASPER-specific: vs. reference]
+2026-05-06 03:28:09,165 - INFO - --- Citation metrics (ALCE) ---
+2026-05-06 03:28:09,165 - INFO - ALCE Citation Precision: 0.5964  [12 refusal]
+2026-05-06 03:28:09,165 - INFO - ALCE Citation Recall:    0.5735  [12 refusal]
+2026-05-06 03:28:09,165 - INFO - ALCE Citation F1:        0.5815  [12 refusal]
 
 # Installer logs
 pip-log.txt
@@ -90,3 +101,6 @@ target/
 
 # Shell-redirect artifacts from unquoted pip install commands (e.g. pip install pkg>=0.0.8)
 =*
+
+# Custom Claude Code agents and prompts (private, not tracked)
+.claude-agents/

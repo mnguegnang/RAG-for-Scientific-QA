@@ -194,6 +194,12 @@ class CRAGEvaluator:
         refined = []
         query_terms = set(query.lower().split()) - _STOPWORDS
 
+        # Yan et al. (2024) CRAG §3.4: lower θ for short queries to avoid
+        # collapsing context to zero sentences (calibrated for 9-word avg queries;
+        # QASPER short queries have 3-5 terms after stopword removal).
+        min_overlap = max(1, min(self.min_strip_query_overlap,
+                                 max(1, len(query_terms) - 1)))
+
         for doc in documents:
             label = doc.get('crag_label', 'Incorrect')
 
@@ -204,7 +210,8 @@ class CRAGEvaluator:
                 refined.append(doc)
             elif label == 'Ambiguous':
                 strips = self._decompose_to_strips(doc.get('text', ''))
-                relevant_strips = self._filter_strips(query_terms, strips)
+                relevant_strips = self._filter_strips(query_terms, strips,
+                                                      min_overlap=min_overlap)
 
                 if relevant_strips:
                     refined_doc = doc.copy()
@@ -240,19 +247,26 @@ class CRAGEvaluator:
         sentences = re.split(r'(?<=[.!?])\s+', text)
         return [s.strip() for s in sentences if len(s.strip()) > 20]
 
-    def _filter_strips(self, query_terms: set, strips: List[str]) -> List[str]:
+    def _filter_strips(self, query_terms: set, strips: List[str],
+                       min_overlap: int = None) -> List[str]:
         """
         Filter knowledge strips by term overlap with the query.
 
-        A strip is kept if it shares at least ``min_strip_query_overlap``
-        terms with the query. This is a lightweight proxy for the T5-based
-        strip evaluator described in the paper (Section 3.2).
+        A strip is kept if it shares at least *min_overlap* terms with the
+        query (defaults to ``self.min_strip_query_overlap``).  Callers may
+        pass an adaptive *min_overlap* computed from query length so that
+        short queries (3-5 content terms after stopword removal) do not cause
+        the filter to collapse all context to zero sentences.
+
+        This is a lightweight proxy for the T5-based strip evaluator described
+        in the paper (Section 3.2).
         """
+        threshold = min_overlap if min_overlap is not None else self.min_strip_query_overlap
         relevant = []
         for strip in strips:
             strip_terms = set(strip.lower().split()) - _STOPWORDS
             overlap = len(query_terms & strip_terms)
-            if overlap >= self.min_strip_query_overlap:
+            if overlap >= threshold:
                 relevant.append(strip)
         return relevant
 

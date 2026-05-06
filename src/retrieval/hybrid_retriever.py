@@ -170,7 +170,26 @@ class HybridRetriever:
         if filter_paper_id:
             dense_res  = [r for r in dense_res  if r.get("doc_id") == filter_paper_id][:k]
             sparse_res = [r for r in sparse_res if r.get("doc_id") == filter_paper_id][:k]
-        
+
+            # BM25-only fallback: pad dense_res when the paper-scoped dense
+            # filter returns fewer than k//2 results.  This happens when the
+            # paper has few dense-indexed chunks (short papers) or when the
+            # SPECTER2 embedding is a poor match for the query.  BM25 exact-
+            # keyword matches are more robust in this regime.
+            if len(dense_res) < k // 2:
+                logger.warning(
+                    "Dense filter returned only %d/%d results for paper '%s'; "
+                    "padding with BM25-only results.",
+                    len(dense_res), k, filter_paper_id,
+                )
+                dense_texts = {r["text"] for r in dense_res}
+                sparse_extra = [
+                    r for r in self._search_sparse(query, k * 4)
+                    if r.get("doc_id") == filter_paper_id
+                    and r["text"] not in dense_texts
+                ]
+                dense_res = (dense_res + sparse_extra)[:k]
+
         # 2. Apply RRF
         # Map unique text/ID to accumulated score
         # We use text as key to de-duplicate, assuming unique text per chunk

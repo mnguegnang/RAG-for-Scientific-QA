@@ -447,7 +447,8 @@ class LocalLLMGenerator:
         return answer
 
     # ── HyDE: Hypothetical Document Embedding ──────────────────────────────────
-    def generate_hypothetical_answer(self, query: str) -> str:
+    def generate_hypothetical_answer(self, query: str,
+                                     filter_paper_id: str = None) -> str:
         """
         Generates a brief hypothetical passage for HyDE dense retrieval.
 
@@ -455,6 +456,11 @@ class LocalLLMGenerator:
         would directly answer *query*, as if extracted from a scientific paper.
         This passage is then encoded by SPECTER2 in place of the raw query,
         closing the query-document semantic gap.
+
+        When *filter_paper_id* is set, a scoping note is appended to the prompt
+        so the hypothetical passage is grounded in the vocabulary and framing of
+        the target paper, improving dense-retrieval precision on paper-specific
+        QASPER queries.
 
         Reference:
             Gao et al. (2022). Precise Zero-Shot Dense Retrieval without
@@ -470,6 +476,11 @@ class LocalLLMGenerator:
             f"Question: {query}\n\n"
             "Hypothetical passage:"
         )
+        if filter_paper_id:
+            hyde_prompt += (
+                f"\nNote: The answer should be from an NLP research paper "
+                f"with ID: {filter_paper_id}."
+            )
         if self.backend == "ollama":
             payload = {
                 "model": self.model_name,

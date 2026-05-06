@@ -3,7 +3,14 @@
     "allow": [
       "Bash(/teamspace/studios/this_studio/RAG-for-Scientific-QA/.venv/bin/python -c \"import sys; print\\(sys.executable, sys.version\\)\")",
       "Bash(/teamspace/studios/this_studio/RAG-for-Scientific-QA/.venv/bin/python -c \"import datasets\")",
-      "Bash(.venv/bin/python *)"
+      "Bash(.venv/bin/python *)",
+      "Bash(git ls-remote *)",
+      "Bash(git clone *)",
+      "Bash(cp /tmp/custom-agents/ai-research-scientist.md /tmp/custom-agents/code-review-improve.md /tmp/custom-agents/ml-genai-coder.md .claude-agents/agents/)",
+      "Bash(cp /tmp/agent-prompts/*.md .claude-agents/prompts/)",
+      "Bash(git check-ignore *)",
+      "Bash(python *)",
+      "Bash(git stash *)"
     ]
   }
 }

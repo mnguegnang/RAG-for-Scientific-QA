@@ -158,6 +158,13 @@ def generate_evaluation_dataset(output_path: str = None):
         # Reasoning sentences have no [Doc N] tags and artificially lower Citation Recall.
         answer = extract_final_answer(full_answer)
 
+        # Track whether the <Final Answer> tag was absent from the LLM output.
+        # When True, extract_final_answer fell back to returning the full response,
+        # which includes the <Reasoning> block and degrades ALCE/RAGAS scores.
+        extraction_fallback = not bool(re.search(
+            r'<Final\s+Answer>', full_answer, re.IGNORECASE
+        ))
+
         # RAGAS requires 'contexts' to be a list of strings.
         # The order here matches the [Doc N] citation numbering used by the generator.
         context_strings = [doc["text"] for doc in retrieved_docs]
@@ -170,13 +177,14 @@ def generate_evaluation_dataset(output_path: str = None):
             default=float("-inf"),
         )
         results.append({
-            "question":          qa["question"],
-            "ground_truth":      qa["ground_truth"],
-            "contexts":          context_strings,
-            "answer":            answer,          # Final Answer only — used by RAGAS + ALCE
-            "full_answer":       full_answer,     # Full LLM output — kept for debugging
-            "best_rerank_score": best_score,      # Used by calibrate_crag.py
-            "crag_triggered":    pipeline_output.get("crag_triggered", False),
+            "question":           qa["question"],
+            "ground_truth":       qa["ground_truth"],
+            "contexts":           context_strings,
+            "answer":             answer,               # Final Answer only — used by RAGAS + ALCE
+            "full_answer":        full_answer,          # Full LLM output — kept for debugging
+            "best_rerank_score":  best_score,           # Used by calibrate_crag.py
+            "crag_triggered":     pipeline_output.get("crag_triggered", False),
+            "extraction_fallback": extraction_fallback, # True when <Final Answer> tag was absent
         })
         
     # 3. Save to disk
@@ -260,6 +268,9 @@ def regenerate_error_rows(csv_path: str = None):
             retrieved_docs = pipeline_output["retrieved_docs"]
 
         answer = extract_final_answer(full_answer)
+        extraction_fallback = not bool(re.search(
+            r'<Final\s+Answer>', full_answer, re.IGNORECASE
+        ))
         context_strings = [doc["text"] for doc in retrieved_docs]
         best_score = max(
             (d.get("rerank_score", float("-inf")) for d in retrieved_docs),
@@ -277,6 +288,7 @@ def regenerate_error_rows(csv_path: str = None):
         df.at[idx, 'contexts'] = str(context_strings)
         df.at[idx, 'best_rerank_score'] = best_score
         df.at[idx, 'crag_triggered'] = pipeline_output.get("crag_triggered", False)
+        df.at[idx, 'extraction_fallback'] = extraction_fallback
         fixed += 1
 
     df.to_csv(csv_path, index=False)
