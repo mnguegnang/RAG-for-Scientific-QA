@@ -13,17 +13,10 @@ class QasperChunker:
            required by SPECTER2's 512 absolute limit).
         """
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-<<<<<<< HEAD
-        
+
         # Prevent HuggingFace from throwing console warnings when calculating length
         self.tokenizer.model_max_length = int(1e30)
 
-=======
-        
-        # Prevent HuggingFace from throwing console warnings when calculating length
-        self.tokenizer.model_max_length = int(1e30)
-        
->>>>>>> cc6e01ad33bfbf2fa9000592545c986b7eeb4561
         self.max_tokens = max_tokens
         # Calculate overlap tokens (e.g., 500 * 0.1 = 50 tokens)
         self.overlap_tokens = int(max_tokens * overlap_pct)

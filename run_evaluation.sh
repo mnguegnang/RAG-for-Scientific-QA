@@ -38,13 +38,7 @@ set -e
 echo "Starting Evaluation Job on Node: ${HOSTNAME}"
 
 # ============================================================
-# ENVIRONMENT
-# ============================================================
-source ~/miniconda3/bin/activate 2>/dev/null || true
-conda activate qasper-rag
-
-# ============================================================
-# PROJECT ROOT — SLURM-safe detection
+# PROJECT ROOT — SLURM-safe detection (must happen first)
 # ============================================================
 if [ -n "${SLURM_SUBMIT_DIR}" ]; then
     PROJECT_ROOT="${SLURM_SUBMIT_DIR}"
@@ -53,6 +47,17 @@ else
 fi
 cd "${PROJECT_ROOT}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
+
+# ============================================================
+# ENVIRONMENT — activated after PROJECT_ROOT is known
+# ============================================================
+VENV_ACTIVATE="${PROJECT_ROOT}/.venv/bin/activate"
+if [ ! -f "${VENV_ACTIVATE}" ]; then
+    echo "ERROR: virtualenv not found at ${VENV_ACTIVATE}"
+    echo "       Run: uv venv && uv pip install -r requirements.txt"
+    exit 1
+fi
+source "${VENV_ACTIVATE}"
 
 # ============================================================
 # HuggingFace token
@@ -95,9 +100,10 @@ if [ "${_FREE_GB}" -ge "${_REQUIRED_GB}" ]; then
     export HF_HOME="${_SCRATCH_DIR}/.cache/huggingface"
     echo "HF cache    : ${HF_HOME} (${_FREE_GB} GB free on /scratch)"
 else
-    export HF_HOME="${HOME}/.cache/huggingface"
-    echo "HF cache    : ${HF_HOME} (scratch has ${_FREE_GB} GB — using home)"
+    export HF_HOME="${PROJECT_ROOT}/.cache/huggingface"
+    echo "HF cache    : ${HF_HOME} (scratch has ${_FREE_GB} GB — using project cache)"
 fi
+mkdir -p "${HF_HOME}"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
@@ -122,6 +128,15 @@ VLLM_PID=""
 PROMETHEUS_PID=""
 PROMETHEUS_PORT=8001
 
+# Detect whether vllm is importable; fall back to transformers if not.
+HAVE_VLLM=false
+if python -c "import vllm" 2>/dev/null; then
+    HAVE_VLLM=true
+    echo "vLLM        : available"
+else
+    echo "vLLM        : not installed — using 'transformers' backend"
+fi
+
 if [ "${N_GPU}" -ge 2 ]; then
     IFS="," read -ra _GPUS <<< "${CUDA_VISIBLE_DEVICES:-$(seq -s, 0 $((N_GPU - 1)))}"
     N_ALLOC=${#_GPUS[@]}
@@ -129,25 +144,30 @@ if [ "${N_GPU}" -ge 2 ]; then
     VLLM_GPUS=$(IFS=,; echo "${_GPUS[*]:0:$((N_ALLOC - 1))}")
     TP_SIZE=$((N_ALLOC - 1))
     USE_GPU=true
-    # Generation: 85% VRAM (dedicated vLLM GPUs, no RAG models competing)
     GEN_MEM_UTIL="0.85"
-    # Evaluation: 85% VRAM (RAG models are no longer running)
     EVAL_MEM_UTIL="0.85"
-    GENERATOR_BACKEND_VALUE=vllm
-    echo "GPU layout  : vLLM on [${VLLM_GPUS}] (TP=${TP_SIZE}) | RAG/Eval on [${RAG_GPU}]"
+    if [ "${HAVE_VLLM}" = true ]; then
+        GENERATOR_BACKEND_VALUE=vllm
+        echo "GPU layout  : vLLM on [${VLLM_GPUS}] (TP=${TP_SIZE}) | RAG/Eval on [${RAG_GPU}]"
+    else
+        GENERATOR_BACKEND_VALUE=transformers
+        echo "GPU layout  : transformers on all GPUs [${CUDA_VISIBLE_DEVICES:-all}] | RAG/Eval on [${RAG_GPU}]"
+    fi
 
 elif [ "${N_GPU}" -eq 1 ]; then
     RAG_GPU="${CUDA_VISIBLE_DEVICES:-0}"
     VLLM_GPUS="${RAG_GPU}"
     TP_SIZE=1
     USE_GPU=true
-    # Generation: 60% VRAM — leaves headroom for SPECTER2 + ColBERT on same GPU.
-    # RTX 4090 (24 GB): 60% = 14.4 GB for Llama 3.1-8B, ~9 GB for RAG models.
     GEN_MEM_UTIL="0.60"
-    # Evaluation: 80% VRAM — SPECTER2/ColBERT are done; Prometheus 2-7B ≈ 14 GB.
     EVAL_MEM_UTIL="0.80"
-    GENERATOR_BACKEND_VALUE=vllm
-    echo "GPU layout  : single GPU [${RAG_GPU}] (RTX 4090 / A100 single-GPU mode)"
+    if [ "${HAVE_VLLM}" = true ]; then
+        GENERATOR_BACKEND_VALUE=vllm
+        echo "GPU layout  : single GPU [${RAG_GPU}] (vLLM mode)"
+    else
+        GENERATOR_BACKEND_VALUE=transformers
+        echo "GPU layout  : single GPU [${RAG_GPU}] (transformers mode)"
+    fi
 
 else
     USE_GPU=false
@@ -186,9 +206,9 @@ wait_for_server() {
 }
 
 # ============================================================
-# PHASE 1 — Start Llama vLLM server (generation)
+# PHASE 1 — Start Llama vLLM server (generation, vLLM only)
 # ============================================================
-if [ "${USE_GPU}" = true ]; then
+if [ "${USE_GPU}" = true ] && [ "${HAVE_VLLM}" = true ]; then
     check_hf_access "meta-llama/Llama-3.1-8B-Instruct"
 
     echo "Starting Llama 3.1-8B vLLM server (port 8000, TP=${TP_SIZE})..."
@@ -216,9 +236,9 @@ GENERATOR_BACKEND="${GENERATOR_BACKEND_VALUE}" \
 python -m src.evaluation.generate_predictions
 
 # ============================================================
-# PHASE 3 — Stop Llama, start Prometheus 2 vLLM (evaluation)
+# PHASE 3 — Stop Llama, start Prometheus 2 vLLM (evaluation, vLLM only)
 # ============================================================
-if [ "${USE_GPU}" = true ]; then
+if [ "${USE_GPU}" = true ] && [ "${HAVE_VLLM}" = true ]; then
     echo "Stopping Llama vLLM (PID ${VLLM_PID}) before starting Prometheus 2..."
     kill "${VLLM_PID}" 2>/dev/null || true
     wait "${VLLM_PID}" 2>/dev/null || true

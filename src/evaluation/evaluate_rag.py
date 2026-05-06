@@ -255,7 +255,6 @@ class PrometheusJudge:
     """
 
     MODEL_ID = "prometheus-eval/prometheus-7b-v2.0"
-    NLI_THRESHOLD = 4
     _SCORE_RE = re.compile(r"\[RESULT\]\s*(\d)", re.IGNORECASE)
 
     def __init__(
@@ -407,8 +406,11 @@ class PrometheusJudge:
         Aligned with RAGAS ContextRecall (Es et al. 2023 §3.2).
         Returns normalized score in [0.0, 1.0].
         """
+        # Fix 2+3: 1500-char limit captures >97% of chunks fully (median chunk
+        # is 594 chars; 500-char limit cut 64% of chunks — Es et al. 2023 §3.2
+        # pass full context). Using all 10 reranked passages, not just 6.
         ctx_block = "\n---\n".join(
-            f"[Passage {i + 1}] {c[:500]}" for i, c in enumerate(contexts[:6])
+            f"[Passage {i + 1}] {c[:1500]}" for i, c in enumerate(contexts[:10])
         )
         instruction = (
             "You are a scientific RAG evaluator. Determine how well the retrieved "
@@ -438,8 +440,10 @@ class PrometheusJudge:
         Aligned with RAGAS Faithfulness (Es et al. 2023 §3.3).
         Returns normalized score in [0.0, 1.0].
         """
+        # Fix 2: 1500-char limit captures >97% of chunks fully — same rationale
+        # as context_recall fix (Es et al. 2023 §3.3 pass full context strings).
         ctx_block = "\n---\n".join(
-            f"[Passage {i + 1}] {c[:500]}" for i, c in enumerate(contexts[:5])
+            f"[Passage {i + 1}] {c[:1500]}" for i, c in enumerate(contexts[:5])
         )
         instruction = (
             "You are a scientific RAG evaluator. Determine whether every factual "
@@ -533,11 +537,21 @@ class PrometheusJudge:
         """
         NLI entailment check for ALCE citation evaluation.
 
-        Uses Prometheus 2 NLI rubric (Kim et al. 2024) in place of the previous
-        ad-hoc TRUE/FALSE prompt. Score >= 4 → entailed (rubric: document
-        'substantially supports' the claim), matching ALCE's definition that a
-        cited sentence is supported when the cited passage entails it (Gao et al.
-        2023 §4.1).
+        Fix 1: Replaces the ABSOLUTE_PROMPT-based rubric call with a direct
+        True/False binary prompt. ABSOLUTE_PROMPT expects a student response to
+        grade; passing a meta-statement ("Evaluating whether the document
+        entails...") in the `response` field confuses the model and produces
+        systematically low scores (1-2), making every NLI check return False
+        and collapsing ALCE to near zero.
+
+        This follows the original ALCE design (Gao et al. 2023, EMNLP 2023,
+        §4.1): entailment is binary — a cited passage either supports the claim
+        or it does not. Honovich et al. (2022) TRUE (NAACL 2022) formalises this
+        as binary NLI classification; we approximate it with a direct True/False
+        instruction to Prometheus 2.
+
+        Fix 2 also applied: context window raised from 1000 → 1500 chars so
+        the cited passage is not truncated before the supporting evidence.
         """
         if not cited_text.strip():
             return False
@@ -545,29 +559,32 @@ class PrometheusJudge:
         if not clean_claim:
             return False
 
-        instruction = (
-            "You are performing natural language inference (NLI). Evaluate the "
-            "degree to which the provided document passage entails (supports) the "
-            "given claim. Paraphrasing and implicit support count; exact wording "
-            "is not required.\n\n"
-            f"Document passage: {cited_text[:1000]}\n\n"
-            f"Claim to evaluate: {clean_claim[:300]}"
+        # Direct binary NLI prompt — bypasses ABSOLUTE_PROMPT entirely.
+        # Numerical format equivalence: "84.3%" and "0.843" are the same value.
+        prompt = (
+            "You are an NLI judge for scientific text. "
+            "Determine whether the document passage below supports the claim. "
+            "Paraphrasing and implicit support both count; exact wording is not "
+            "required. For numerical claims, percentage and decimal formats are "
+            "equivalent ('84.3%' and '0.843' express the same value).\n\n"
+            f"Document passage:\n{cited_text[:1500]}\n\n"
+            f"Claim: {clean_claim[:400]}\n\n"
+            "Does the document passage support the claim? "
+            "Answer with exactly one word: True or False."
         )
-        score = self._call(
-            instruction=instruction,
-            response=(
-                f'Evaluating whether the document entails: "{clean_claim[:200]}"'
-            ),
-            reference_answer=(
-                "The document directly and explicitly contains evidence that makes "
-                "the claim clearly true, with no need for inference beyond what is stated."
-            ),
-            rubric=_RUBRICS["nli_entailment"],
-        )
-        if score is None:
-            logging.warning("[Prometheus/NLI] score parse failed — treating as not entailed.")
+        text = self._generate(prompt).strip()
+
+        # Parse True/False case-insensitively; accept yes/no as fallback.
+        if re.search(r"\bTrue\b", text, re.IGNORECASE):
+            return True
+        if re.search(r"\bFalse\b", text, re.IGNORECASE):
             return False
-        return score >= self.NLI_THRESHOLD
+        if re.search(r"\byes\b", text, re.IGNORECASE):
+            return True
+        if re.search(r"\bno\b", text, re.IGNORECASE):
+            return False
+        logging.warning("[NLI] Could not parse True/False from: %.80s", text)
+        return False
 
 
 # ── ALCE evaluator ────────────────────────────────────────────────────────────

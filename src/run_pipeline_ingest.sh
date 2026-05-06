@@ -11,13 +11,7 @@
 #SBATCH --partition=all               #cluster's partition name
 
 # ============================================================
-# ENVIRONMENT
-# ============================================================
-source ~/miniconda3/bin/activate
-conda activate qasper-rag
-
-# ============================================================
-# PROJECT ROOT — SLURM-safe detection
+# PROJECT ROOT — SLURM-safe detection (must happen first)
 # ============================================================
 # SLURM copies the batch script to its spool directory before running it,
 # so BASH_SOURCE[0] resolves to /var/spool/slurmd/jobXXX/slurm_script —
@@ -35,6 +29,19 @@ else
     PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
 cd "${PROJECT_ROOT}"
+
+# ============================================================
+# ENVIRONMENT — activated after PROJECT_ROOT is known
+# ============================================================
+#source ~/miniconda3/bin/activate
+#conda activate qasper-rag
+VENV_ACTIVATE="${PROJECT_ROOT}/.venv/bin/activate"
+if [ ! -f "${VENV_ACTIVATE}" ]; then
+    echo "ERROR: virtualenv not found at ${VENV_ACTIVATE}"
+    echo "       Run: uv venv && uv pip install -r requirements.txt"
+    exit 1
+fi
+source "${VENV_ACTIVATE}"
 
 # Prepend the project root to PYTHONPATH so that `python -m src.*` always
 # resolves imports from THIS copy of the project, not any stale editable
@@ -77,8 +84,15 @@ check_hf_access() {
     echo "HuggingFace access confirmed for '${model_id}' (HTTP ${http_code})"
 }
 
-# Point HF cache to scratch space — avoids filling your home quota
-export HF_HOME="/scratch/$USER/.cache/huggingface"
+# Point HF cache to the project's .cache dir (works on Lightning Studios and
+# interactive runs where /scratch is not available; falls back to the SLURM
+# scratch path only when that directory actually exists).
+if [ -d "/scratch/$USER" ]; then
+    export HF_HOME="/scratch/$USER/.cache/huggingface"
+else
+    export HF_HOME="${PROJECT_ROOT}/.cache/huggingface"
+fi
+mkdir -p "${HF_HOME}"
 
 # SLURM already sets CUDA_VISIBLE_DEVICES to the allocated GPU indices
 # (e.g. "0,1,2" for --gres=gpu:3).  We intentionally do NOT override it
