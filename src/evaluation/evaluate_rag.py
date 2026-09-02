@@ -399,26 +399,18 @@ class PrometheusJudge:
             rubric=_RUBRICS["context_precision"],
         ))
 
-    def score_context_recall(self, question: str, contexts: List[str],
-                             ground_truth: str) -> float:
+    def _score_context_recall_items(
+        self, question: str, contexts: List[str], ground_truth: str
+    ) -> List[Tuple[str, bool]]:
         """
-        Coverage of the ground-truth answer by all retrieved passages.
+        Atomic per-sentence judgments backing score_context_recall.
 
-        Implements sentence-level attribution: each ground-truth sentence is
-        checked independently via a binary True/False NLI prompt against the
-        full set of retrieved passages.  The metric is the fraction of GT
-        sentences supported by at least one passage.
-
-        Reference:
-            Es et al. (2023). RAGAS: Automated Evaluation of Retrieval
-            Augmented Generation Systems. §3.2, Definition 3 — sentence-level
-            attribution loop: recall = |{s ∈ GT : ∃p ∈ C, p supports s}| / |GT|.
-
-        Returns float in [0.0, 1.0], or float("nan") if no GT sentences or no
-        contexts are available.
+        Returns [(gt_sentence, supported), ...] — one entry per ground-truth
+        sentence, in order. Empty list if no GT sentences or no contexts are
+        available (mirrors the nan-triggering conditions of the wrapper).
         """
         if not contexts or not ground_truth:
-            return float("nan")
+            return []
 
         ctx_block = "\n---\n".join(
             f"[Passage {i + 1}] {c[:1500]}" for i, c in enumerate(contexts[:10])
@@ -426,9 +418,9 @@ class PrometheusJudge:
 
         gt_sentences = [s for s in nltk.sent_tokenize(ground_truth) if len(s) >= 10]
         if not gt_sentences:
-            return float("nan")
+            return []
 
-        supported = 0
+        items = []
         for gt_sent in gt_sentences:
             prompt = (
                 "You are a scientific RAG evaluator.\n"
@@ -457,32 +449,47 @@ class PrometheusJudge:
             logging.debug(
                 "[ContextRecall] GT sentence %r → %s", gt_sent[:60], result
             )
-            if result:
-                supported += 1
+            items.append((gt_sent, result))
 
-        return supported / len(gt_sentences)
+        return items
 
-    def score_faithfulness(self, question: str, answer: str,
-                           contexts: List[str]) -> float:
+    def score_context_recall(self, question: str, contexts: List[str],
+                             ground_truth: str) -> float:
         """
-        Degree to which the generated answer is grounded in retrieved contexts.
+        Coverage of the ground-truth answer by all retrieved passages.
 
-        Implements per-claim binary NLI: each sentence from the generated answer
-        is treated as a distinct claim and verified independently against the
-        retrieved passages via a True/False prompt.  The metric is the fraction
-        of claims supported by at least one passage.
+        Implements sentence-level attribution: each ground-truth sentence is
+        checked independently via a binary True/False NLI prompt against the
+        full set of retrieved passages.  The metric is the fraction of GT
+        sentences supported by at least one passage.
 
-        References:
-            Es et al. (2023). RAGAS §3.3, Definition 4 — per-claim grounding
-            check: faithfulness = |{c ∈ A : ∃p ∈ C, p supports c}| / |A|.
-            Zheng et al. (2023). MT-Bench §4.2 — single-criterion per call
-            yields more reliable binary judgements than holistic multi-claim prompts.
+        Reference:
+            Es et al. (2023). RAGAS: Automated Evaluation of Retrieval
+            Augmented Generation Systems. §3.2, Definition 3 — sentence-level
+            attribution loop: recall = |{s ∈ GT : ∃p ∈ C, p supports s}| / |GT|.
 
-        Returns float in [0.0, 1.0], or float("nan") if no claim sentences or
-        no contexts are available.
+        Returns float in [0.0, 1.0], or float("nan") if no GT sentences or no
+        contexts are available.
+        """
+        items = self._score_context_recall_items(question, contexts, ground_truth)
+        if not items:
+            return float("nan")
+        return sum(r for _, r in items) / len(items)
+
+    def _score_faithfulness_items(
+        self, question: str, answer: str, contexts: List[str]
+    ) -> List[Tuple[str, bool]]:
+        """
+        Atomic per-claim judgments backing score_faithfulness.
+
+        Returns [(claim_sentence, supported), ...] — one entry per claim
+        sentence in the generated answer (citation markers stripped), in
+        order. Skips sentences that are empty after stripping citation
+        markers. Empty list if no claim sentences or no contexts are
+        available (mirrors the nan-triggering conditions of the wrapper).
         """
         if not contexts or not answer:
-            return float("nan")
+            return []
 
         ctx_block = "\n---\n".join(
             f"[Passage {i + 1}] {c[:1500]}" for i, c in enumerate(contexts[:5])
@@ -491,14 +498,17 @@ class PrometheusJudge:
         raw_sentences = nltk.sent_tokenize(answer)
         claim_sentences = [s for s in raw_sentences if len(s) >= 15]
         if not claim_sentences:
-            return float("nan")
+            return []
 
-        supported = 0
+        items = []
         for sent in claim_sentences:
             clean_sent = re.sub(
                 r"\[Doc \d+(?:,\s*Doc \d+)*\]", "", sent
             ).strip()
             if not clean_sent:
+                # Preserve original denominator behavior: counted as
+                # unsupported without an NLI call (nothing left to check).
+                items.append((sent, False))
                 continue
 
             prompt = (
@@ -527,10 +537,33 @@ class PrometheusJudge:
             logging.debug(
                 "[Faithfulness] Claim %r → %s", clean_sent[:60], result
             )
-            if result:
-                supported += 1
+            items.append((clean_sent, result))
 
-        return supported / len(claim_sentences)
+        return items
+
+    def score_faithfulness(self, question: str, answer: str,
+                           contexts: List[str]) -> float:
+        """
+        Degree to which the generated answer is grounded in retrieved contexts.
+
+        Implements per-claim binary NLI: each sentence from the generated answer
+        is treated as a distinct claim and verified independently against the
+        retrieved passages via a True/False prompt.  The metric is the fraction
+        of claims supported by at least one passage.
+
+        References:
+            Es et al. (2023). RAGAS §3.3, Definition 4 — per-claim grounding
+            check: faithfulness = |{c ∈ A : ∃p ∈ C, p supports c}| / |A|.
+            Zheng et al. (2023). MT-Bench §4.2 — single-criterion per call
+            yields more reliable binary judgements than holistic multi-claim prompts.
+
+        Returns float in [0.0, 1.0], or float("nan") if no claim sentences or
+        no contexts are available.
+        """
+        items = self._score_faithfulness_items(question, answer, contexts)
+        if not items:
+            return float("nan")
+        return sum(r for _, r in items) / len(items)
 
     def score_answer_relevancy(self, question: str, answer: str) -> float:
         """
@@ -618,7 +651,7 @@ class PrometheusJudge:
             rubric=_RUBRICS["answer_correctness"],
         ))
 
-    def check_nli_entailment(self, claim: str, cited_text: str) -> bool:
+    def check_nli_entailment(self, claim: str, cited_text: str) -> Tuple[bool, Optional[str]]:
         """
         NLI entailment check for ALCE citation evaluation.
 
@@ -637,12 +670,15 @@ class PrometheusJudge:
 
         Fix 2 also applied: context window raised from 1000 → 1500 chars so
         the cited passage is not truncated before the supporting evidence.
+
+        Returns (result, prompt_used) — prompt_used is None on the short-circuit
+        paths (empty cited_text / empty claim) where no NLI call was made.
         """
         if not cited_text.strip():
-            return False
+            return False, None
         clean_claim = re.sub(r"\[Doc \d+(?:,\s*Doc \d+)*\]", "", claim).strip()
         if not clean_claim:
-            return False
+            return False, None
 
         # Direct binary NLI prompt — bypasses ABSOLUTE_PROMPT entirely.
         # Numerical format equivalence: "84.3%" and "0.843" are the same value.
@@ -661,15 +697,15 @@ class PrometheusJudge:
 
         # Parse True/False case-insensitively; accept yes/no as fallback.
         if re.search(r"\bTrue\b", text, re.IGNORECASE):
-            return True
+            return True, prompt
         if re.search(r"\bFalse\b", text, re.IGNORECASE):
-            return False
+            return False, prompt
         if re.search(r"\byes\b", text, re.IGNORECASE):
-            return True
+            return True, prompt
         if re.search(r"\bno\b", text, re.IGNORECASE):
-            return False
+            return False, prompt
         logging.warning("[NLI] Could not parse True/False from: %.80s", text)
-        return False
+        return False, prompt
 
 
 # ── ALCE evaluator ────────────────────────────────────────────────────────────
@@ -683,8 +719,6 @@ class ALCEEvaluator:
         with Citations. EMNLP 2023. §4 — citation precision and recall.
     """
 
-    MIN_CLAIM_LENGTH = 15
-
     def __init__(self, judge: PrometheusJudge):
         self.judge = judge
         try:
@@ -693,51 +727,115 @@ class ALCEEvaluator:
         except Exception as exc:
             logging.warning("NLTK download failed: %s", exc)
 
+    def _entails(self, sentence: str, passage: str, memo: dict) -> bool:
+        """NLI check, memoised within one answer (the removal test repeats pairs)."""
+        key = (sentence, passage)
+        if key not in memo:
+            result, _prompt_used = self.judge.check_nli_entailment(sentence, passage)
+            memo[key] = result
+        return memo[key]
+
     def calculate_metrics(self, answer: str, contexts: list) -> Tuple[float, float]:
+        """
+        ALCE citation precision and recall (Gao et al., EMNLP 2023, §4).
+
+        These are two different quantities, computed over two different
+        denominators — a previous revision used `sentences_with_citations` for
+        both, which made recall algebraically identical to precision and their
+        F1 identical to each. Following the reference implementation
+        (github.com/princeton-nlp/ALCE, eval.py):
+
+          recall    = sentences whose joint citation set entails them
+                      / ALL sentences in the answer.
+                      Uncited factual sentences must count against recall —
+                      that is the whole point of the metric.
+
+          precision = citations judged correct / TOTAL number of citations.
+                      A citation is correct when the sentence is jointly
+                      entailed AND either (a) that citation alone entails the
+                      sentence, or (b) removing it breaks the entailment (it
+                      was necessary). A citation that is neither is padding,
+                      and only this denominator can penalise it.
+        """
         sentences = nltk.sent_tokenize(answer)
         if not sentences:
             return 0.0, 0.0
 
-        supported_sentences = 0
-        sentences_with_citations = 0
+        memo = {}
+        entail = 0            # sentences supported by their own citation set
+        entail_prec = 0       # individual citations judged correct
+        total_citations = 0
 
         for sentence in sentences:
-            citations = re.findall(r"Doc (\d+)", sentence)
-            if not citations:
+            # De-duplicate while preserving order: "[Doc 2] ... [Doc 2]" is one citation.
+            seen, cited_idx = set(), []
+            for doc_id_str in re.findall(r"Doc (\d+)", sentence):
+                idx = int(doc_id_str) - 1
+                if 0 <= idx < len(contexts) and idx not in seen:
+                    seen.add(idx)
+                    cited_idx.append(idx)
+            if not cited_idx:
+                # Counts in recall's denominator, contributes nothing to either
+                # numerator. An uncited claim is exactly what recall penalises.
                 continue
-            sentences_with_citations += 1
-            cited_texts = []
-            for doc_id_str in citations:
-                doc_idx = int(doc_id_str) - 1
-                if 0 <= doc_idx < len(contexts):
-                    cited_texts.append(contexts[doc_idx])
-            combined = " ".join(cited_texts)
-            if self.judge.check_nli_entailment(sentence, combined):
-                supported_sentences += 1
 
-        precision = (
-            supported_sentences / sentences_with_citations
-            if sentences_with_citations > 0 else 0.0
-        )
-        # Gao et al. (2023) EMNLP §4.1, Equation 2: denominator = sentences_with_citations
-        # (model instruction mandates [Doc N] on every factual claim; uncited sentences
-        # are reasoning steps or connectors, not factual claims requiring support)
-        claim_bearing = sentences_with_citations
-        recall = supported_sentences / claim_bearing if claim_bearing > 0 else 0.0
+            total_citations += len(cited_idx)
+            joint = " ".join(contexts[i] for i in cited_idx)
+            if not self._entails(sentence, joint, memo):
+                continue                      # unsupported: no precision credit either
+            entail += 1
+
+            if len(cited_idx) == 1:
+                # The joint check already established this single citation entails.
+                entail_prec += 1
+                continue
+
+            for i in cited_idx:
+                if self._entails(sentence, contexts[i], memo):
+                    entail_prec += 1          # (a) sufficient on its own
+                    continue
+                rest = " ".join(contexts[j] for j in cited_idx if j != i)
+                if not self._entails(sentence, rest, memo):
+                    entail_prec += 1          # (b) necessary to the joint support
+                # else: the rest still entails without it — irrelevant citation
+
+        recall = entail / len(sentences)
+        precision = entail_prec / total_citations if total_citations > 0 else 0.0
         return precision, recall
 
 
 # ── Hardware-aware judge initialisation ──────────────────────────────────────
 
-def _is_vllm_server_ready(port: int, timeout: float = 5.0) -> bool:
-    """Return True if a vLLM (OpenAI-compatible) server responds on *port*."""
+def _is_vllm_server_ready(port: int, timeout: float = 5.0,
+                          model_id: Optional[str] = None) -> bool:
+    """
+    Return True only if a vLLM server serving *model_id* answers on *port*.
+
+    Probing /health is not sufficient: on RunPod an nginx instance listens on
+    the default port 8001 and answers /health with an empty HTTP 200, which
+    would make the judge silently send every request to nginx instead of
+    Prometheus 2. /v1/models must list the model we expect.
+    """
+    import json
     import urllib.request
+
+    model_id = model_id or PrometheusJudge.MODEL_ID
     try:
-        url = f"http://localhost:{port}/health"
-        with urllib.request.urlopen(url, timeout=timeout):
-            return True
+        url = f"http://localhost:{port}/v1/models"
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
     except Exception:
         return False
+
+    served = {m.get("id") for m in payload.get("data", []) if isinstance(m, dict)}
+    if model_id in served:
+        return True
+    if served:
+        logging.warning(
+            "Port %d serves %s, not %s — ignoring it.",
+            port, sorted(served), model_id,
+        )
+    return False
 
 
 def get_prometheus_judge() -> Tuple[PrometheusJudge, bool]:

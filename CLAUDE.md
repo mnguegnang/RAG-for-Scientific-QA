@@ -4,16 +4,47 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Environment Setup
 
+**Two virtualenvs are required — they cannot be merged.** vLLM 0.28 depends on
+`transformers>=5.5` and `huggingface_hub>=1.27`; the SPECTER2 encoder depends on
+`adapters`, which pins `transformers~=4.51` and needs the pre-1.0
+`huggingface_hub` API (it imports `HfFolder`). No `adapters` release supports
+transformers 5.x, so a resolver rejects the combination outright. They never
+need to share an environment: the pipeline reaches vLLM only over HTTP and
+never imports it. Installing vLLM into `.venv` silently upgrades transformers
+and breaks SPECTER2 with a misleading "adapters package is required" error.
+
 ```bash
-conda create -n qasper-rag python=3.10 && conda activate qasper-rag
-pip install -e .
-pip install -r requirements.txt
-# FAISS must be installed via conda (pip version has no GPU support):
+# 1. Project env — RAG pipeline, evaluation, ingestion
+uv venv --python 3.10 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+
+# 2. Server env — vLLM only (Llama 3.1 generation + Prometheus 2 judging)
+uv venv --python 3.10 .venv-vllm
+uv pip install --python .venv-vllm/bin/python vllm==0.28.0
+
+# FAISS must be installed via conda for GPU support (pip is CPU-only):
 #   CPU: conda install -c pytorch faiss-cpu=1.9.0
 #   GPU: conda install -c pytorch -c nvidia faiss-gpu=1.9.0 pytorch-cuda=12.1
-python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); nltk.download('stopwords')"
+.venv/bin/python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); nltk.download('stopwords')"
 export HF_TOKEN="hf_XXXX"   # required for meta-llama/Llama-3.1-8B-Instruct
 ```
+
+`run_evaluation.sh` picks the interpreter per phase automatically (`RAG_PY` /
+`VLLM_PY`) and falls back to `.venv` when `.venv-vllm` is absent.
+
+**Cache placement (RunPod).** `/` is a small container overlay; `/workspace` is
+the persistent network volume. `run_evaluation.sh` pins `HF_HOME`,
+`VLLM_CACHE_ROOT`, `TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR` and
+`NLTK_DATA` under `/workspace` so the container disk never fills and the
+torch.compile artifacts (~20 min to rebuild on a new GPU arch) survive a pod
+restart. It also sources `/workspace/.bashrc_custom`, which non-interactive
+shells skip.
+
+**`hf_transfer` is mandatory here.** The RunPod image exports
+`HF_HUB_ENABLE_HF_TRANSFER=1`; if the module is missing from an env, every
+HuggingFace download raises — and transformers reports it as an unrelated
+`Unrecognized model ... no model_type key` error. It is pinned in
+`requirements.txt`; install it in `.venv-vllm` too.
 
 ## Key Commands
 

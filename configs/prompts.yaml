@@ -20,9 +20,19 @@ generation:
   #   {paper_focus_instruction} — the Step 0 paper-focus instruction above
   #   {query}                   — the user's question
   #
-  # One-shot example sourced from real QASPER data (paper 1909.00694,
-  # question "What is the seed lexicon?") to enforce strict [Doc N] citation
-  # format compliance.
+  # One-shot example: SYNTHETIC, and deliberately not drawn from QASPER.
+  #
+  # It previously used QASPER paper 1909.00694 / "What is the seed lexicon?",
+  # which is an item in the evaluation set — the model reproduced the exemplar
+  # answer near-verbatim on that row and was scored on it. A demonstration
+  # that appears in the test set is contamination, and it inflates whichever
+  # rows it covers.
+  #
+  # A synthetic exemplar is immune to this no matter how the evaluation set is
+  # later drawn, and it costs nothing: per Min et al. 2022 below, demonstrations
+  # teach output format rather than task semantics, which is all this one is for.
+  # If you replace it, do not source the replacement from any split that the
+  # evaluation samples from.
   # Rationale:
   #   - Gao et al. 2023 (ALCE, arXiv:2305.14627): ALCE uses regex \[Doc \d+\]
   #     to extract citations; format deviations yield a score of 0.
@@ -46,17 +56,17 @@ generation:
 
     <Example>
     Context:
-    [Doc 1] The seed lexicon matches neither the former nor the latter event, and their discourse relation type is Cause. We assume the two events have the same polarities.
-    [Doc 2] The seed lexicon consists of positive and negative predicates. If the predicate of an extracted event is in the seed lexicon, we assign the corresponding polarity score (+1 for positive events and -1 for negative events) to the event.
-    [Doc 3] We constructed our seed lexicon consisting of 15 positive words and 15 negative words.
+    [Doc 1] Title: A Gated Alignment Network for Cross-Lingual Entity Linking. Section: Model. The alignment gate is a scalar produced by a feed-forward layer over the concatenated mention and candidate encodings.
+    [Doc 2] Title: A Gated Alignment Network for Cross-Lingual Entity Linking. Section: Model. We initialise the gate bias to -1.0 so that the network starts close to the monolingual baseline and learns to open the gate only where cross-lingual evidence helps.
+    [Doc 3] Title: A Gated Alignment Network for Cross-Lingual Entity Linking. Section: Experiments. Training used a batch size of 64 for 12 epochs on two V100 GPUs.
 
-    Question: What is the seed lexicon?
+    Question: How is the alignment gate initialised?
 
     <Reasoning>
-    Doc 2 directly defines the seed lexicon as a collection of positive and negative predicates used to assign polarity scores. Doc 3 adds construction details. Doc 1 describes a specific case where the lexicon does not match.
+    Doc 2 states the initialisation directly: the gate bias is set to -1.0, with the stated intent of starting near the monolingual baseline. Doc 1 describes what the gate is but not how it is initialised. Doc 3 covers training configuration and is not relevant to this question.
     </Reasoning>
     <Final Answer>
-    The seed lexicon is a vocabulary of positive and negative predicates [Doc 2]. It assigns polarity scores (+1 for positive and -1 for negative events) to extracted events whose predicates appear in the lexicon [Doc 2]. The lexicon was constructed with 15 positive and 15 negative words [Doc 3].
+    The alignment gate's bias is initialised to -1.0 [Doc 2]. This starts the network close to the monolingual baseline, so the gate opens only where cross-lingual evidence is helpful [Doc 2].
     </Final Answer>
     </Example>
 

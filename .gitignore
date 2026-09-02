@@ -104,3 +104,7 @@ target/
 
 # Custom Claude Code agents and prompts (private, not tracked)
 .claude-agents/
+
+.venv-vllm/
+logs/*.pid
+logs/.*.pid

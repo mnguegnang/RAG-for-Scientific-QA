@@ -75,9 +75,39 @@ class Specter2Encoder:
         try:
             from adapters import AutoAdapterModel  # type: ignore
         except ImportError as e:
+            # Distinguish "not installed" from "installed but incompatible".
+            # `adapters` pins transformers ~=4.51 and needs huggingface_hub's
+            # pre-1.0 API; vLLM pulls transformers>=5.5 and huggingface_hub>=1.27,
+            # so installing vLLM into this environment breaks the import here
+            # with a misleading message. vLLM belongs in its own virtualenv
+            # (.venv-vllm) — it is only ever reached over HTTP.
+            import importlib.util
+            if importlib.util.find_spec("adapters") is None:
+                raise ImportError(
+                    "The 'adapters' package is required for SPECTER2. "
+                    "Install it with: pip install adapters"
+                ) from e
+            import importlib.metadata as _md
+
+            def _ver(name: str) -> str:
+                try:
+                    return _md.version(name)
+                except Exception:
+                    return "not installed"
+
             raise ImportError(
-                "The 'adapters' package is required for SPECTER2. "
-                "Install it with: pip install adapters"
+                "The 'adapters' package is installed but cannot be imported "
+                f"({e}).\n"
+                f"  adapters={_ver('adapters')} "
+                f"transformers={_ver('transformers')} "
+                f"huggingface-hub={_ver('huggingface-hub')} "
+                f"vllm={_ver('vllm')}\n"
+                "SPECTER2 needs transformers ~=4.51 and huggingface_hub <1.0. "
+                "If vllm is installed here it has forced incompatible versions: "
+                "reinstall this environment with 'uv pip install -r "
+                "requirements.txt' and keep vLLM in a separate virtualenv "
+                "(run_evaluation.sh uses .venv-vllm and reaches the server over "
+                "HTTP, so it never needs to share this one)."
             ) from e
 
         logger.info("Loading SPECTER2 tokenizer from %s ...", self.BASE_MODEL)

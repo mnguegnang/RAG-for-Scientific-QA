@@ -89,10 +89,25 @@ class HybridRetriever:
 
         self.bm25_corpus = [chunk['text'] for chunk in metadata_list] # The actual chunks
         self.bm25_ids = [chunk['paper_id'] for chunk in metadata_list]
+
+        # 5. paper_id -> row indices, for PRE-filtered retrieval.
+        # Filtering after a global top-k starves paper-scoped queries: the
+        # global ranking is dominated by the other ~887 papers, so a paper
+        # holding dozens of relevant chunks can survive with one or none.
+        # Restricting the candidate set *before* ranking makes top-k mean
+        # "top-k within this paper", which is what QASPER asks for
+        # (Dasigi et al., NAACL 2021).
+        self._dense_rows_by_paper = defaultdict(list)
+        for row, chunk in enumerate(self.dense_meta):
+            self._dense_rows_by_paper[chunk['paper_id']].append(row)
+        self._sparse_rows_by_paper = defaultdict(list)
+        for row, paper_id in enumerate(self.bm25_ids):
+            self._sparse_rows_by_paper[paper_id].append(row)
         #self.bm25_corpus = self.bm25_package['metadata'] # The actual chunks
         #self.bm25_ids = self.bm25_package['doc_ids'] # The IDs
             
-    def _search_dense(self, query: str, k: int, dense_query: str = None):
+    def _search_dense(self, query: str, k: int, dense_query: str = None,
+                      filter_paper_id: str = None):
         """Standard Vector Search.
 
         Parameters
@@ -108,8 +123,19 @@ class HybridRetriever:
         # Note: BGE output is usually normalized, but good practice to ensure.
         faiss.normalize_L2(q_vec)
         
-        # Search
-        scores, indices = self.dense_index.search(q_vec, k)
+        # Search. With a paper filter, hand FAISS an IDSelector so the top-k is
+        # computed *within* the paper's rows rather than filtered out of a
+        # global top-k. IndexFlatIP supports this through SearchParameters.
+        if filter_paper_id is not None:
+            rows = self._dense_rows_by_paper.get(filter_paper_id, [])
+            if not rows:
+                return []
+            selector = faiss.IDSelectorBatch(np.asarray(rows, dtype='int64'))
+            params = faiss.SearchParameters(sel=selector)
+            scores, indices = self.dense_index.search(q_vec, min(k, len(rows)),
+                                                      params=params)
+        else:
+            scores, indices = self.dense_index.search(q_vec, k)
         
         results = []
         for i, idx in enumerate(indices[0]):
@@ -121,8 +147,8 @@ class HybridRetriever:
                 })
         return results
 
-    def _search_sparse(self, query: str, k: int):
-        """Standard BM25 Search"""
+    def _search_sparse(self, query: str, k: int, filter_paper_id: str = None):
+        """BM25 search, optionally restricted to one paper's chunks."""
         # tokenize_for_bm25: identical pipeline to index-time (LaTeX strip +
         # lowercase + NLTK word_tokenize + stop-word removal + Porter stemming).
         # Robertson & Zaragoza (2009), BM25 and Beyond.
@@ -130,11 +156,28 @@ class HybridRetriever:
         
         # Get scores
         scores = self.bm25.get_scores(tokenized_query)
-        
-        # Get top K indices using numpy argpartition (faster than full sort)
-        top_n = np.argpartition(scores, -k)[-k:]
-        # Sort these top K by score descending
-        best_indices = top_n[np.argsort(scores[top_n])][::-1]
+
+        # Restrict the candidate pool to the paper before ranking (see the
+        # note on self._dense_rows_by_paper). Ranking globally and filtering
+        # afterwards discards in-paper chunks that never made the global top-k.
+        if filter_paper_id is not None:
+            candidate_rows = np.asarray(
+                self._sparse_rows_by_paper.get(filter_paper_id, []), dtype='int64')
+            if candidate_rows.size == 0:
+                return []
+            candidate_scores = scores[candidate_rows]
+        else:
+            candidate_rows = np.arange(len(scores), dtype='int64')
+            candidate_scores = scores
+
+        # Top-k within the candidate pool. argpartition needs k < n, so clamp.
+        k_eff = min(k, candidate_rows.size)
+        if k_eff < candidate_rows.size:
+            top_n = np.argpartition(candidate_scores, -k_eff)[-k_eff:]
+        else:
+            top_n = np.arange(candidate_rows.size)
+        top_n = top_n[np.argsort(candidate_scores[top_n])][::-1]
+        best_indices = candidate_rows[top_n]
         
         results = []
         for rank, idx in enumerate(best_indices):
@@ -157,38 +200,22 @@ class HybridRetriever:
             Pass a HyDE hypothetical passage here for short queries.
             BM25 sparse search always uses the original *query*.
         """
-        # 1. Get Independent Results
-        # Fetch more candidates when paper-scoped filtering is active so that
-        # after the paper_id post-filter we still return up to k results.
-        # Dasigi et al. (2021 NAACL) — QASPER questions are anchored to one paper;
-        # cross-paper retrieval always produces ALCE=0 because cited evidence
-        # never entails the ground truth from a different paper.
-        broad_k = k * 4 if filter_paper_id else k
-        dense_res = self._search_dense(query, broad_k, dense_query=dense_query)
-        sparse_res = self._search_sparse(query, broad_k)
+        # 1. Get Independent Results.
+        # Both legs pre-filter on paper_id, so each returns its own top-k drawn
+        # from that paper alone. No over-fetch factor and no post-filter: those
+        # only ever recovered whatever happened to survive a global ranking.
+        dense_res = self._search_dense(query, k, dense_query=dense_query,
+                                       filter_paper_id=filter_paper_id)
+        sparse_res = self._search_sparse(query, k,
+                                         filter_paper_id=filter_paper_id)
 
-        if filter_paper_id:
-            dense_res  = [r for r in dense_res  if r.get("doc_id") == filter_paper_id][:k]
-            sparse_res = [r for r in sparse_res if r.get("doc_id") == filter_paper_id][:k]
-
-            # BM25-only fallback: pad dense_res when the paper-scoped dense
-            # filter returns fewer than k//2 results.  This happens when the
-            # paper has few dense-indexed chunks (short papers) or when the
-            # SPECTER2 embedding is a poor match for the query.  BM25 exact-
-            # keyword matches are more robust in this regime.
-            if len(dense_res) < k // 2:
-                logger.warning(
-                    "Dense filter returned only %d/%d results for paper '%s'; "
-                    "padding with BM25-only results.",
-                    len(dense_res), k, filter_paper_id,
-                )
-                dense_texts = {r["text"] for r in dense_res}
-                sparse_extra = [
-                    r for r in self._search_sparse(query, k * 4)
-                    if r.get("doc_id") == filter_paper_id
-                    and r["text"] not in dense_texts
-                ]
-                dense_res = (dense_res + sparse_extra)[:k]
+        if filter_paper_id and not dense_res and not sparse_res:
+            logger.warning(
+                "No chunks indexed for paper '%s'; returning no results. "
+                "Answering from other papers would be worse than abstaining.",
+                filter_paper_id,
+            )
+            return []
 
         # 2. Apply RRF
         # Map unique text/ID to accumulated score

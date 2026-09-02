@@ -138,19 +138,12 @@ class ScientificRAGPipeline:
         logging.info("Stage 1: Fetching top 100 candidates via Hybrid Search (Dense + Sparse)...")
         broad_results = self.retriever.search(query, k=100, dense_query=dense_query, filter_paper_id=filter_paper_id)
 
-        if not broad_results and filter_paper_id:
-            # The paper-scoped filter returned 0 hits — the paper's chunks
-            # may be indexed under a different doc_id key.  Fall back to
-            # unfiltered search so the query still gets an answer rather
-            # than a hard error that produces 0-context rows in the dataset.
-            logging.warning(
-                "Stage 1: filter_paper_id='%s' returned 0 results; "
-                "retrying without paper filter (fallback).",
-                filter_paper_id,
-            )
-            broad_results = self.retriever.search(
-                query, k=100, dense_query=dense_query, filter_paper_id=None
-            )
+        # No unfiltered retry. On a paper-anchored benchmark, answering from a
+        # different paper is strictly worse than abstaining: the cited evidence
+        # cannot entail the ground truth, so such rows scored context_recall
+        # 0.038 / answer_correctness 0.125 against 0.373 / 0.468 for
+        # paper-scoped rows. Retrieval now pre-filters, so 0 results means the
+        # paper genuinely has no indexed chunks.
 
         if not broad_results:
             return {

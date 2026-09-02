@@ -43,5 +43,8 @@ ragatouille>=0.0.8,<0.0.10  # <0.0.10: 0.0.10 switches to PyLate backend; pin St
 
 adapters==1.2.0
 
+scikit-learn==1.7.2  # Cohen's kappa for judge validation (src/evaluation/compute_agreement.py)
+
 #uvicorn[standard]==0.41.0
 python-dotenv>=0.5.1
+hf_transfer==0.1.9  # HF_HUB_ENABLE_HF_TRANSFER=1 is set in the RunPod container; without this every download fails

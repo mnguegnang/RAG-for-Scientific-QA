@@ -1,4 +1,5 @@
 import os
+import random
 import re
 import json
 import logging
@@ -68,19 +69,34 @@ def extract_final_answer(full_response: str) -> str:
     return full_response
 
 
-def fetch_qasper_sample(num_samples: int = 10) -> List[Dict]:
+def fetch_qasper_sample(num_samples: int = 10, seed: int = 20260902) -> List[Dict]:
     """
-    Fetches a subset of the QASPER validation dataset, filtering for 
-    questions that have a definitive free-form text answer.
+    Draw a random, seeded sample of QASPER questions that have a free-form answer.
+
+    The train split is used because the retrieval index is built from it — a
+    question whose paper is not indexed can never be answered. (The papers must
+    be in the index; that is not the same as tuning on them, which is what the
+    exemplar in configs/prompts.yaml previously did.)
+
+    Sampling is seeded and drawn over the *whole* split. Taking the first
+    num_samples in dataset order, as this function used to, clusters the sample
+    into a handful of papers — the first 15 questions came from 6 papers, and 7
+    of them from one — so per-paper retrieval quality dominated the aggregate
+    and the result was not a sample of the benchmark. Change `seed` to draw a
+    different evaluation set; keep it fixed to compare runs.
     """
-    logging.info("Loading QASPER validation dataset...")
-    dataset = load_dataset("allenai/qasper", split="train") # not split="validation" because indexing is done on the train set
-    
+    logging.info("Loading QASPER (train split) and sampling %d questions (seed=%d)...",
+                 num_samples, seed)
+    # Only the question/answer columns are needed here. Keeping full_text
+    # would decode the entire body of all 888 papers just to enumerate
+    # questions, which dominates the runtime of this function.
+    dataset = load_dataset("allenai/qasper", split="train").select_columns(["id", "qas"])
+
     qa_pairs = []
     for row in dataset:
         questions = row['qas']['question']
         answers = row['qas']['answers']
-        
+
         for q_idx, q in enumerate(questions):
             ans_list = answers[q_idx]['answer']
             for ans in ans_list:
@@ -91,11 +107,16 @@ def fetch_qasper_sample(num_samples: int = 10) -> List[Dict]:
                         "paper_id":     row["id"],  # QASPER paper ID — used to scope retrieval
                     })
                     break # Stop if we found a valid answer for this question
-        
-        if len(qa_pairs) >= num_samples:
-            break
-            
-    return qa_pairs
+
+    if num_samples >= len(qa_pairs):
+        logging.warning("Requested %d questions but only %d are available; using all.",
+                        num_samples, len(qa_pairs))
+        return qa_pairs
+
+    sample = random.Random(seed).sample(qa_pairs, num_samples)
+    logging.info("Sampled %d questions spanning %d papers (from a pool of %d).",
+                 len(sample), len({p["paper_id"] for p in sample}), len(qa_pairs))
+    return sample
 
 def generate_evaluation_dataset(output_path: str = None):
     """
@@ -140,19 +161,16 @@ def generate_evaluation_dataset(output_path: str = None):
         full_answer = pipeline_output["answer"]
         retrieved_docs = pipeline_output["retrieved_docs"]
 
-        # Fix 5 — Fallback for empty-context rows (Lewis et al., 2020, NeurIPS
-        # Section 4.3): RAG with zero passages degenerates to unconditioned
-        # generation.  If paper-scoped retrieval failed, retry without the
-        # filter so every question gets at least some context for RAGAS/ALCE.
+        # No unfiltered retry (see run_rag.py). Substituting another paper's
+        # passages produced 32/150 contaminated rows whose scores were ~10x
+        # worse than paper-scoped rows; a 0-context row is the honest outcome
+        # and is now visible in the metrics rather than silently repaired.
         if not retrieved_docs and qa.get("paper_id"):
             logging.warning(
-                "Question %d/%d: 0 docs with paper_id='%s'; "
-                "retrying without paper filter (fallback).",
+                "Question %d/%d: 0 docs for paper_id='%s' — recording an "
+                "empty-context row rather than answering from another paper.",
                 i + 1, len(qa_pairs), qa["paper_id"],
             )
-            pipeline_output = rag_pipeline.ask(qa["question"], filter_paper_id=None)
-            full_answer = pipeline_output["answer"]
-            retrieved_docs = pipeline_output["retrieved_docs"]
 
         # Strip <Reasoning> block: ALCE and RAGAS evaluate only the cited <Final Answer>.
         # Reasoning sentences have no [Doc N] tags and artificially lower Citation Recall.
