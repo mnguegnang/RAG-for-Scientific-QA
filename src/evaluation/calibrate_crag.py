@@ -4,16 +4,29 @@ CRAG Threshold Calibration
 Two calibration modes for the ColBERT v2 CRAG gate in run_rag.py.
 
 Mode 1 — "f1"  (default, when context_recall is available):
-    Runs retrieval + reranking on the evaluation set, records each query’s
-    maximum reranker logit, plots distributions for relevant vs. irrelevant
-    retrievals, and finds the F1-maximising threshold.
+    Runs retrieval + reranking on the evaluation set, records each query's
+    maximum ColBERT v2 MaxSim rerank score, and calibrates BOTH thresholds
+    the live CRAG gate (src/retrieval/crag_evaluator.py) actually uses:
+    `correct_threshold` and `ambiguous_threshold` (there is no single
+    "CRAG_THRESHOLD" anywhere in the current code — that was this script's
+    stale target before this rewrite).
+
+    context_recall (a float in [0,1], the fraction of ground-truth sentences
+    supported by the retrieved set) is used to derive three ordered classes
+    per query: Incorrect (==0), Ambiguous (0 < x < 1), Correct (==1). Two
+    independent F1-maximising boundary searches are run on the same score
+    distribution:
+        ambiguous_threshold = boundary separating Incorrect vs {Ambiguous, Correct}
+        correct_threshold   = boundary separating {Incorrect, Ambiguous} vs Correct
     Requires evaluation_report.csv with a non-NaN context_recall column.
 
     Reference:
         Yan et al. (2024). CRAG: Corrective Retrieval Augmented Generation.
         arXiv:2401.15884. §3.3: "We calibrate the retrieval evaluator threshold
         empirically on the score distribution of training samples to maximise
-        retrieval F1."
+        retrieval F1." (Applied here twice, once per threshold boundary, since
+        the live gate is a two-threshold three-way classifier, not a single
+        binary gate.)
 
 Mode 2 — "percentile" (fallback when context_recall is all-NaN):
     Reads best_rerank_score directly from evaluation_dataset.csv (written by
@@ -35,7 +48,7 @@ Usage (from project root):
     python -m src.evaluation.calibrate_crag --mode percentile --percentile 5
 
 Output:
-    • Console: per-query table + recommended CRAG_THRESHOLD value
+    • Console: per-query table + recommended --crag-ambiguous/--crag-correct values
     • Plot saved to reports/figures/crag_calibration.png
 """
 
@@ -58,11 +71,18 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def _load_eval_data(eval_csv: str) -> pd.DataFrame:
     """
-    Load the evaluation CSV and derive binary relevance labels.
+    Load the evaluation CSV and derive the three-class CRAG label from
+    context_recall.
 
     Accepts evaluation_report.csv (written by evaluate_rag.py), which contains
-    the RAGAS context_recall column needed to derive relevance labels.
+    the context_recall column needed to derive labels.
     Required columns: one of {'question', 'user_input'} and 'context_recall'.
+
+    Classes (mirroring crag_evaluator.py's {Correct, Ambiguous, Incorrect}):
+        Incorrect — context_recall == 0   (no retrieved passage supports any
+                                            ground-truth sentence)
+        Ambiguous — 0 < context_recall < 1 (partial support)
+        Correct   — context_recall == 1   (full support)
     """
     df = pd.read_csv(eval_csv)
 
@@ -78,13 +98,27 @@ def _load_eval_data(eval_csv: str) -> pd.DataFrame:
         )
 
     df_labelled = df.dropna(subset=['context_recall']).copy()
-    df_labelled['relevant'] = (df_labelled['context_recall'] > 0).astype(int)
 
+    def _class(recall: float) -> str:
+        if recall <= 0:
+            return 'Incorrect'
+        if recall >= 1:
+            return 'Correct'
+        return 'Ambiguous'
+
+    df_labelled['crag_class'] = df_labelled['context_recall'].apply(_class)
+    # Binary views the two F1 searches need — kept as columns (not just
+    # locals) so the per-query table printed in calibrate() shows them.
+    df_labelled['is_at_least_ambiguous'] = (df_labelled['crag_class'] != 'Incorrect').astype(int)
+    df_labelled['is_correct'] = (df_labelled['crag_class'] == 'Correct').astype(int)
+
+    counts = df_labelled['crag_class'].value_counts()
     logging.info(
-        "Loaded %d labelled samples  (%d relevant, %d irrelevant).",
+        "Loaded %d labelled samples  (Incorrect=%d, Ambiguous=%d, Correct=%d).",
         len(df_labelled),
-        df_labelled['relevant'].sum(),
-        (df_labelled['relevant'] == 0).sum(),
+        int(counts.get('Incorrect', 0)),
+        int(counts.get('Ambiguous', 0)),
+        int(counts.get('Correct', 0)),
     )
     return df_labelled
 
@@ -161,13 +195,16 @@ def _find_f1_threshold(scores: np.ndarray,
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
-def _plot(scores: np.ndarray, labels: np.ndarray,
-          best_threshold: float, candidates, f1_curve,
+def _plot(scores: np.ndarray, crag_class: np.ndarray,
+          ambiguous_threshold: float, ambiguous_candidates, ambiguous_f1_curve,
+          correct_threshold: float, correct_candidates, correct_f1_curve,
           output_plot: str) -> None:
     """
-    Two-panel figure:
-      Left  — histogram of max reranker logits, relevant vs. irrelevant.
-      Right — F1 score as a function of threshold.
+    Two-panel figure for the two-threshold calibration:
+      Left  — histogram of max rerank scores, split into the three CRAG
+              classes (Incorrect / Ambiguous / Correct), with both
+              calibrated threshold lines.
+      Right — both F1-vs-threshold curves overlaid, one per boundary.
     """
     try:
         import matplotlib.pyplot as plt
@@ -175,39 +212,45 @@ def _plot(scores: np.ndarray, labels: np.ndarray,
         logging.warning("matplotlib not installed — skipping plot.")
         return
 
-    rel = scores[(labels == 1) & ~np.isnan(scores)]
-    irr = scores[(labels == 0) & ~np.isnan(scores)]
+    valid = ~np.isnan(scores)
+    incorrect = scores[valid & (crag_class == 'Incorrect')]
+    ambiguous = scores[valid & (crag_class == 'Ambiguous')]
+    correct   = scores[valid & (crag_class == 'Correct')]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-    # Panel 1: distributions
+    # Panel 1: three-class distributions + both thresholds
     bins = 15
-    if len(rel):
-        ax1.hist(rel, bins=bins, alpha=0.7, color='steelblue',
-                 label='Relevant  (context_recall > 0)')
-    if len(irr):
-        ax1.hist(irr, bins=bins, alpha=0.7, color='salmon',
-                 label='Irrelevant (context_recall = 0)')
-    ax1.axvline(best_threshold, color='black', linestyle='--', linewidth=2,
-                label=f'F1-max threshold = {best_threshold:.3f}')
-    ax1.axvline(0.0, color='grey', linestyle=':', linewidth=1,
-                label='Default threshold (0.0)')
-    ax1.set_xlabel('Max Reranker Score (ColBERT v2 MaxSim)')
+    if len(incorrect):
+        ax1.hist(incorrect, bins=bins, alpha=0.7, color='salmon',
+                 label='Incorrect (context_recall = 0)')
+    if len(ambiguous):
+        ax1.hist(ambiguous, bins=bins, alpha=0.7, color='khaki',
+                 label='Ambiguous (0 < context_recall < 1)')
+    if len(correct):
+        ax1.hist(correct, bins=bins, alpha=0.7, color='steelblue',
+                 label='Correct (context_recall = 1)')
+    ax1.axvline(ambiguous_threshold, color='darkorange', linestyle='--', linewidth=2,
+                label=f'ambiguous_threshold = {ambiguous_threshold:.3f}')
+    ax1.axvline(correct_threshold, color='black', linestyle='--', linewidth=2,
+                label=f'correct_threshold = {correct_threshold:.3f}')
+    ax1.set_xlabel('Max Rerank Score (ColBERT v2 MaxSim)')
     ax1.set_ylabel('Count')
-    ax1.set_title('CRAG Gate – Reranker Logit Distributions')
-    ax1.legend()
+    ax1.set_title('CRAG Gate – Score Distributions by Class')
+    ax1.legend(fontsize=8)
     ax1.grid(alpha=0.3)
 
-    # Panel 2: F1 curve
-    ax2.plot(candidates, f1_curve, color='steelblue', linewidth=2)
-    ax2.axvline(best_threshold, color='black', linestyle='--', linewidth=2,
-                label=f'F1-max = {max(f1_curve):.3f} @ {best_threshold:.3f}')
-    ax2.axvline(0.0, color='grey', linestyle=':', linewidth=1,
-                label='Default (0.0)')
+    # Panel 2: both F1 curves
+    ax2.plot(ambiguous_candidates, ambiguous_f1_curve, color='darkorange',
+             linewidth=2, label='F1: Incorrect vs {Ambiguous,Correct}')
+    ax2.plot(correct_candidates, correct_f1_curve, color='black',
+             linewidth=2, label='F1: {Incorrect,Ambiguous} vs Correct')
+    ax2.axvline(ambiguous_threshold, color='darkorange', linestyle='--', linewidth=1)
+    ax2.axvline(correct_threshold, color='black', linestyle='--', linewidth=1)
     ax2.set_xlabel('Threshold')
     ax2.set_ylabel('F1 Score')
-    ax2.set_title('F1 vs CRAG Threshold')
-    ax2.legend()
+    ax2.set_title('F1 vs Threshold — Both Boundaries')
+    ax2.legend(fontsize=8)
     ax2.grid(alpha=0.3)
 
     plt.tight_layout()
@@ -220,13 +263,16 @@ def _plot(scores: np.ndarray, labels: np.ndarray,
 # ── Main calibration function ─────────────────────────────────────────────────
 
 def calibrate(eval_csv: str, dense_index: str, dense_meta: str,
-              sparse_index: str, output_plot: str) -> float:
-    """Full calibration pipeline. Returns the recommended threshold."""
+              sparse_index: str, output_plot: str) -> tuple:
+    """
+    Full calibration pipeline for the live two-threshold CRAG gate.
 
-    # 1. Load labelled data
+    Returns (ambiguous_threshold, correct_threshold).
+    """
+
+    # 1. Load labelled data (three-class: Incorrect/Ambiguous/Correct)
     df = _load_eval_data(eval_csv)
     questions = df['question'].tolist()
-    labels    = df['relevant'].values
 
     # 2. Collect max reranker logit per query
     scores = _collect_reranker_scores(
@@ -238,31 +284,70 @@ def calibrate(eval_csv: str, dense_index: str, dense_meta: str,
     df['max_rerank_logit'] = scores
 
     print("\n── Per-query reranker logits ─────────────────────────────────")
-    print(df[['question', 'context_recall', 'relevant', 'max_rerank_logit']]
+    print(df[['question', 'context_recall', 'crag_class', 'max_rerank_logit']]
           .to_string(index=False))
 
-    # 3. Find F1-maximising threshold
-    best_thresh, best_f1, candidates, f1_curve = _find_f1_threshold(
-        scores, labels
-    )
+    # Minimum-class-size guard: the Ambiguous class (0 < context_recall < 1)
+    # is typically much smaller than Incorrect/Correct. With too few examples
+    # the F1 search has almost no signal to place a distinct ambiguous_threshold
+    # boundary and both searches tend to collapse onto the same cutpoint,
+    # which makes CRAG's Ambiguous refinement path structurally unreachable
+    # (crag_evaluator.py: nothing scores between the two thresholds). Warn
+    # loudly rather than silently emitting a threshold pair that breaks the
+    # three-way design.
+    _MIN_CLASS_SIZE = 10
+    class_counts = df['crag_class'].value_counts()
+    thin_classes = {c: int(n) for c, n in class_counts.items() if n < _MIN_CLASS_SIZE}
+    if thin_classes:
+        logging.warning(
+            "Class(es) with <%d examples: %s. The corresponding threshold "
+            "boundary is statistically unreliable — treat it as a lower bound "
+            "on confidence, not a value to apply blindly. Re-run with a "
+            "larger/more diverse evaluation set once more Ambiguous-labelled "
+            "rows are available.",
+            _MIN_CLASS_SIZE, thin_classes,
+        )
+
+    # 3. Two independent F1-maximising boundary searches on the same scores.
+    ambiguous_thresh, ambiguous_f1, ambiguous_cands, ambiguous_curve = \
+        _find_f1_threshold(scores, df['is_at_least_ambiguous'].values)
+    correct_thresh, correct_f1, correct_cands, correct_curve = \
+        _find_f1_threshold(scores, df['is_correct'].values)
+
+    if correct_thresh <= ambiguous_thresh:
+        logging.warning(
+            "correct_threshold (%.4f) <= ambiguous_threshold (%.4f) — the two "
+            "boundaries collapsed onto (near) the same cutpoint, which makes "
+            "the Ambiguous class unreachable in crag_evaluator.py. This is "
+            "expected when the Ambiguous class is thin (see class-size warning "
+            "above) and should NOT be applied to run_rag.py as-is; keep the "
+            "existing ambiguous_threshold until recalibrated with more "
+            "Ambiguous-labelled examples.",
+            correct_thresh, ambiguous_thresh,
+        )
 
     print("\n── Calibration result ────────────────────────────────────────")
-    print(f"  Current default threshold : 0.000  (sigmoid = 0.50)")
-    print(f"  F1-maximising threshold   : {best_thresh:.4f}"
-          f"  (F1 = {best_f1:.4f})")
+    print(f"  Current defaults (src/run_rag.py) : correct=14.0000  ambiguous=8.0000")
+    print(f"  Calibrated ambiguous_threshold     : {ambiguous_thresh:.4f}  (F1 = {ambiguous_f1:.4f})")
+    print(f"  Calibrated correct_threshold       : {correct_thresh:.4f}  (F1 = {correct_f1:.4f})")
     print()
-    print(f"  → To apply: edit CRAG_THRESHOLD in src/run_rag.py:")
-    print(f"      CRAG_THRESHOLD: float = {best_thresh:.4f}")
-    print(f"    or pass --crag-threshold {best_thresh:.4f} at the CLI.")
+    print(f"  → To apply, update the --crag-correct/--crag-ambiguous defaults")
+    print(f"    in src/run_rag.py, or pass at the CLI:")
+    print(f"      --crag-correct {correct_thresh:.4f} --crag-ambiguous {ambiguous_thresh:.4f}")
     print()
     n = len(df)
     print(f"  ⚠  Note: estimated from only {n} samples — re-run with a larger")
     print(f"     evaluation set (≥50 samples) for a robust threshold.")
 
     # 4. Plot
-    _plot(scores, labels, best_thresh, candidates, f1_curve, output_plot)
+    _plot(
+        scores, df['crag_class'].values,
+        ambiguous_thresh, ambiguous_cands, ambiguous_curve,
+        correct_thresh, correct_cands, correct_curve,
+        output_plot,
+    )
 
-    return best_thresh
+    return ambiguous_thresh, correct_thresh
 
 
 # ── Percentile calibration (Mode 2 — no RAGAS labels needed) ────────────────

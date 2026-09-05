@@ -45,6 +45,18 @@ adapters==1.2.0
 
 scikit-learn==1.7.2  # Cohen's kappa for judge validation (src/evaluation/compute_agreement.py)
 
+# DSPy-compiled generation prompt (Finding #5, key_metrics_improvements.md).
+# Talks to the already-running Llama vLLM server over its OpenAI-compatible
+# endpoint (VLLM_API_URL) — belongs in .venv, not .venv-vllm. Verified clean
+# resolve with no transformers/huggingface_hub conflicts (uv pip install --dry-run).
+dspy==3.3.1
+
+# Second-judge validation (Finding #4, key_metrics_improvements.md).
+# src/evaluation/second_judge_label.py calls the Anthropic API directly
+# (claude-sonnet-5) to independently label judge_validation_blind.csv,
+# cross-checked against Prometheus 2 via compute_agreement.py.
+anthropic==0.69.0
+
 #uvicorn[standard]==0.41.0
 python-dotenv>=0.5.1
 hf_transfer==0.1.9  # HF_HUB_ENABLE_HF_TRANSFER=1 is set in the RunPod container; without this every download fails

@@ -109,6 +109,42 @@ class LocalLLMGenerator:
 
         self._stats["backend"] = self.backend
 
+        # ── Optional DSPy-compiled prompt (Finding #5, key_metrics_improvements.md)
+        # Opt-in only: unset (default) leaves generate_answer's behavior byte-for-
+        # byte unchanged (static configs/prompts.yaml template). Set
+        # DSPY_COMPILED_PROMPT_PATH to a compiled-program JSON (produced by
+        # src/evaluation/compile_dspy_prompt.py) to route generation through it
+        # instead — mirrors the existing GENERATOR_BACKEND env-var opt-in pattern.
+        self._dspy_module = None
+        dspy_path = os.environ.get("DSPY_COMPILED_PROMPT_PATH", "").strip()
+        if dspy_path:
+            if self.backend != "vllm":
+                logging.warning(
+                    "[LLMGenerator] DSPY_COMPILED_PROMPT_PATH is set but backend=%s "
+                    "— DSPy generation is only wired to the vllm backend so it can "
+                    "reuse the already-running Llama vLLM server instead of loading "
+                    "a second copy of the model. Ignoring; using the static template.",
+                    self.backend,
+                )
+            elif not os.path.exists(dspy_path):
+                logging.warning(
+                    "[LLMGenerator] DSPY_COMPILED_PROMPT_PATH=%s does not exist — "
+                    "ignoring, using the static template.", dspy_path,
+                )
+            else:
+                import dspy
+                from src.generation.dspy_module import ScientificRAGModule
+                dspy.settings.configure(
+                    lm=dspy.LM(f"openai/{self.model_name}", api_base=self.vllm_url,
+                              api_key="EMPTY")
+                )
+                self._dspy_module = ScientificRAGModule()
+                self._dspy_module.load(dspy_path)
+                logging.info(
+                    "[LLMGenerator] Loaded DSPy-compiled prompt from %s — generation "
+                    "will route through it instead of configs/prompts.yaml.", dspy_path,
+                )
+
     # ── Ollama health check ───────────────────────────────────────────────────
     def _verify_ollama_reachable(self):
         """Fail-fast check that Ollama is reachable before processing begins.
@@ -243,6 +279,9 @@ class LocalLLMGenerator:
         if not retrieved_docs:
             return "No documents were retrieved. Cannot generate an answer."
 
+        if self._dspy_module is not None:
+            return self._generate_via_dspy(query, retrieved_docs)
+
         full_prompt = self._build_prompt(query, retrieved_docs)
 
         # ── Latency + token tracking ─────────────────────────────────────────
@@ -272,6 +311,47 @@ class LocalLLMGenerator:
             "[LLMGenerator] call=%d | backend=%s | latency=%.1fs | "
             "prompt_tok≈%d | completion_tok≈%d | cumulative_latency=%.1fs",
             self._stats["total_calls"], self.backend, elapsed,
+            prompt_tokens_approx, completion_tokens_approx,
+            self._stats["total_latency_s"],
+        )
+        return answer
+
+    def _generate_via_dspy(self, query: str, retrieved_docs: List[Dict[str, Any]]) -> str:
+        """
+        Generation path for the opt-in DSPy-compiled prompt (Finding #5).
+        Renders the module's typed output back into the exact tag shape
+        extract_final_answer expects (dspy_module.render_tagged_output), and
+        tracks latency/token stats the same way generate_answer does so
+        log_generation_summary behaves identically either way.
+        """
+        from src.generation.dspy_module import (
+            DEFAULT_PAPER_FOCUS_HINT,
+            format_context_blocks,
+            render_tagged_output,
+        )
+
+        context_blocks = format_context_blocks(retrieved_docs)
+        prompt_tokens_approx = sum(len(c.split()) for c in context_blocks) + len(query.split())
+
+        t0 = time.time()
+        pred = self._dspy_module(
+            context=context_blocks,
+            paper_focus_hint=DEFAULT_PAPER_FOCUS_HINT,
+            question=query,
+        )
+        answer = render_tagged_output(pred.reasoning, pred.cited_answer)
+        elapsed = time.time() - t0
+
+        completion_tokens_approx = len(answer.split())
+        self._stats["total_calls"] += 1
+        self._stats["total_latency_s"] += elapsed
+        self._stats["total_prompt_tokens_approx"] += prompt_tokens_approx
+        self._stats["total_completion_tokens_approx"] += completion_tokens_approx
+
+        logging.info(
+            "[LLMGenerator] call=%d | backend=dspy | latency=%.1fs | "
+            "prompt_tok≈%d | completion_tok≈%d | cumulative_latency=%.1fs",
+            self._stats["total_calls"], elapsed,
             prompt_tokens_approx, completion_tokens_approx,
             self._stats["total_latency_s"],
         )

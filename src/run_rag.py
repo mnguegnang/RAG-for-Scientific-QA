@@ -23,7 +23,11 @@ class ScientificRAGPipeline:
                  generator_backend: str = "auto",
                  ollama_model: str = "llama3",
                  hf_model: str = "meta-llama/Llama-3.1-8B-Instruct",
-                 crag_correct_threshold: float = 14.0,
+                 # See the --crag-correct/--crag-ambiguous CLI help below for the
+                 # 2026-09-02 recalibration rationale (calibrate_crag.py). This is
+                 # the default generate_predictions.py actually uses (it does not
+                 # pass CRAG thresholds explicitly), so it must match the CLI default.
+                 crag_correct_threshold: float = 14.4403,
                  crag_ambiguous_threshold: float = 8.0,
                  crag_consistency_ratio: float = 0.3):
         """
@@ -228,8 +232,19 @@ def main():
     parser.add_argument("--dense-index", type=str, default="data/indices/dense.index")
     parser.add_argument("--dense-meta", type=str, default="data/indices/dense.index.meta")
     parser.add_argument("--sparse-index", type=str, default="data/indices/sparse.pkl")
-    parser.add_argument("--crag-correct", type=float, default=14.0,
-        help="ColBERT MaxSim threshold for CRAG 'Correct' label (default: 14.0)")
+    # correct_threshold recalibrated 2026-09-02 via
+    # `python -m src.evaluation.calibrate_crag` against the post-paper-scoping-fix
+    # evaluation_report.csv (123 labelled rows: Incorrect=73, Ambiguous=4, Correct=46):
+    # F1-maximising boundary for {Incorrect,Ambiguous} vs Correct = 14.4403 (F1=0.5542).
+    # ambiguous_threshold intentionally left at its prior value: the same run's
+    # boundary search for Incorrect vs {Ambiguous,Correct} also landed at 14.4403
+    # (i.e. collapsed onto correct_threshold), because the Ambiguous class had only
+    # 4 examples — not enough signal to place a distinct boundary. Applying that
+    # value would make CRAG's Ambiguous refinement path unreachable (no score would
+    # ever fall between the two thresholds). Re-run calibrate_crag.py once a larger/
+    # more diverse evaluation set has more Ambiguous-labelled rows.
+    parser.add_argument("--crag-correct", type=float, default=14.44,
+        help="ColBERT MaxSim threshold for CRAG 'Correct' label (default: 14.44)")
     parser.add_argument("--crag-ambiguous", type=float, default=8.0,
         help="ColBERT MaxSim threshold for CRAG 'Ambiguous' label (default: 8.0)")
     parser.add_argument("--crag-consistency", type=float, default=0.3,
