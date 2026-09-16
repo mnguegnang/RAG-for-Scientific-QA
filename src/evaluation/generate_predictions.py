@@ -197,6 +197,7 @@ def generate_evaluation_dataset(output_path: str = None):
         results.append({
             "question":           qa["question"],
             "ground_truth":       qa["ground_truth"],
+            "paper_id":           qa.get("paper_id"),   # persisted so --fix-errors can re-scope retrieval
             "contexts":           context_strings,
             "answer":             answer,               # Final Answer only — used by RAGAS + ALCE
             "full_answer":        full_answer,          # Full LLM output — kept for debugging
@@ -257,7 +258,6 @@ def regenerate_error_rows(csv_path: str = None):
     )
 
     # Initialize pipeline (Ollama health check will run at init)
-    import ast
     generator_backend = os.environ.get("GENERATOR_BACKEND", "auto")
     rag_pipeline = ScientificRAGPipeline(
         dense_index_path="data/indices/dense.index",
@@ -275,15 +275,21 @@ def regenerate_error_rows(csv_path: str = None):
             error_num, n_errors, idx, question[:80],
         )
 
-        pipeline_output = rag_pipeline.ask(question)
+        paper_id = row["paper_id"] if "paper_id" in df.columns and pd.notna(row.get("paper_id")) else None
+        pipeline_output = rag_pipeline.ask(question, filter_paper_id=paper_id)
         full_answer = pipeline_output["answer"]
         retrieved_docs = pipeline_output["retrieved_docs"]
 
-        # Fallback: retry without paper filter if zero docs
-        if not retrieved_docs:
-            pipeline_output = rag_pipeline.ask(question, filter_paper_id=None)
-            full_answer = pipeline_output["answer"]
-            retrieved_docs = pipeline_output["retrieved_docs"]
+        # No unfiltered retry (see generate_evaluation_dataset / run_rag.py). Retrying
+        # without filter_paper_id pulls passages from other papers, which is the same
+        # contamination the main generation path deliberately stopped doing. A 0-context
+        # row is the honest outcome here too.
+        if not retrieved_docs and paper_id:
+            logging.warning(
+                "Row %d: 0 docs for paper_id='%s' — recording an empty-context row "
+                "rather than answering from another paper.",
+                idx, paper_id,
+            )
 
         answer = extract_final_answer(full_answer)
         extraction_fallback = not bool(re.search(
