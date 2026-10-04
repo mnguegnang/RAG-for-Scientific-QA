@@ -45,6 +45,11 @@ adapters==1.2.0
 
 scikit-learn==1.7.2  # Cohen's kappa for judge validation (src/evaluation/compute_agreement.py)
 
+# Unit tests (tests/). MiniCheck (lytang/MiniCheck-Flan-T5-Large, used by
+# src/evaluation/grounding.py) needs no extra package: it is a plain
+# transformers seq2seq checkpoint, run with the reference inference re-implemented.
+pytest==8.4.2
+
 # DSPy-compiled generation prompt (Finding #5, key_metrics_improvements.md).
 # Talks to the already-running Llama vLLM server over its OpenAI-compatible
 # endpoint (VLLM_API_URL) — belongs in .venv, not .venv-vllm. Verified clean

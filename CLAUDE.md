@@ -50,7 +50,8 @@ HuggingFace download raises — and transformers reports it as an unrelated
 
 **Build indices (required before first use):**
 ```bash
-python -m src.pipeline_ingest          # local GPU
+python -m src.data.arxiv_tables        # optional, ~45 min: table bodies from arXiv LaTeX -> data/table_bodies.json
+python -m src.pipeline_ingest          # local GPU (uses data/table_bodies.json when present)
 sbatch src/run_pipeline_ingest.sh      # SLURM
 ```
 
@@ -63,11 +64,15 @@ python -m src.run_rag --query "..." --backend transformers --hf-model meta-llama
 
 **Run evaluation:**
 ```bash
-python -m src.evaluation.generate_predictions   # writes data/evaluation_dataset.csv
-python -m src.evaluation.evaluate_rag           # writes data/evaluation_report.csv
-bash run_evaluation.sh                          # end-to-end (RunPod / interactive)
+python -m src.evaluation.evaluate_retrieval     # offline evidence recall vs QASPER gold evidence (no LLM)
+python -m src.evaluation.generate_predictions   # writes data/evaluation_dataset.csv (accepts --context-k, --crag-mode, ...)
+python -m src.evaluation.evaluate_rag           # writes data/evaluation_report.csv (--grounding-checker hybrid|minicheck|prometheus)
+bash run_evaluation.sh                          # end-to-end (RunPod / interactive); PIPELINE_ARGS / GROUNDING_CHECKER env
 sbatch run_evaluation.sh                        # end-to-end SLURM job
 python -m src.evaluation.calibrate_crag         # CRAG threshold calibration + plot
+python -m src.evaluation.compare_grounding_checkers  # kappa of MiniCheck vs Prometheus against labels
+python -m src.evaluation.compare_reports A.csv B.csv # paired per-metric deltas with bootstrap CIs
+.venv/bin/python -m pytest tests                # unit tests (HF_HOME must point at the model cache)
 ```
 
 **Environment variables:**
@@ -75,28 +80,34 @@ python -m src.evaluation.calibrate_crag         # CRAG threshold calibration + p
 - `GENERATOR_BACKEND` — override LLM backend: `vllm`, `transformers`, or `ollama`
 - `VLLM_API_URL` — Llama vLLM server endpoint (default: `http://localhost:8000/v1`)
 - `PROMETHEUS_PORT` — Prometheus 2 vLLM port for evaluation (default: `8001`)
+- `GROUNDING_CHECKER` — support-check judge for evaluation: `hybrid` (default), `minicheck`, `prometheus`
+- `PIPELINE_ARGS` — extra context-selection flags `run_evaluation.sh` passes to `generate_predictions`
+- `SKIP_GENERATION=1` / `EVAL_ARGS` — `run_evaluation.sh` resume controls (reuse predictions; extra `evaluate_rag` flags)
+- `MINICHECK_DTYPE` — `bfloat16` (default on GPU) or `float32`
 
 ## Architecture
 
 The pipeline is in `src/run_rag.py::ScientificRAGPipeline` and runs four sequential stages:
 
-**Stage 1 — Hybrid Retrieval (`src/retrieval/hybrid_retriever.py`)**
-Fetches top-100 candidates by fusing dense FAISS search (SPECTER2 embeddings, `allenai/specter2_base`) and BM25 sparse search using Reciprocal Rank Fusion (`rrf_k=60`). Short queries (< 10 words) trigger HyDE: the LLM generates a hypothetical passage that is encoded for dense search in place of the raw question; BM25 always uses the original query.
+`ScientificRAGPipeline.retrieve_context()` runs stages 1-3 (usable without an LLM via `load_generator=False`, as the retrieval harness and the DSPy compiler do); `ask()` adds generation. Context-selection settings (`--context-k`, `--context-order`, `--final-ranking`, `--crag-mode`, `--max-context-tokens`) are shared by `run_rag.py`, `generate_predictions.py` and `compile_dspy_prompt.py` via `add_pipeline_args`, and are saved per run in the `pipeline_config` column.
 
-**Stage 2 — Reranking (`src/retrieval/reranker.py`)**
-ColBERT v2 late-interaction (`colbert-ir/colbertv2.0`) via RAGatouille narrows to top-10 using MaxSim scoring. Replaces the previous `BAAI/bge-reranker-v2-m3` cross-encoder.
+**Stage 1 — Hybrid Retrieval (`src/retrieval/hybrid_retriever.py`)**
+Fetches up to 100 candidates (paper-scoped by `filter_paper_id`) by fusing dense FAISS search (SPECTER2 embeddings, `allenai/specter2_base`) and BM25 sparse search using Reciprocal Rank Fusion (`rrf_k=60`). Results carry chunk metadata (`chunk_id`, `section_name`, `chunk_type`, `position`) and each leg's rank (`dense_rank`, `sparse_rank`). 94% of QASPER papers have ≤ 100 chunks, so under paper scoping stage 1 returns the whole paper. Short queries (< 10 words) trigger HyDE for the dense leg only when it can change the outcome (`final_ranking="rrf"` or a paper larger than the candidate pool).
+
+**Stage 2 — Ranking (`src/retrieval/reranker.py`, `src/retrieval/context_selection.py`)**
+ColBERT v2 late-interaction (`colbert-ir/colbertv2.0`) via RAGatouille scores every candidate (MaxSim). The final ranking is ColBERT alone (default) or RRF of ColBERT + BM25 + SPECTER2 ranks (`--final-ranking rrf`); the top `context_k` (default 20) are kept, each tagged with `rerank_rank`.
 
 **Stage 3 — CRAG Evaluation (`src/retrieval/crag_evaluator.py`)**
-Classifies each document as `{Correct, Ambiguous, Incorrect}` using ColBERT MaxSim scores against two thresholds (`correct_threshold=14.0`, `ambiguous_threshold=8.0`). A self-consistency ratio determines the overall action. Ambiguous documents are refined via sentence-level strip filtering. Incorrect action falls back to top-3 by rerank score (no hard refusal).
+Labels each document `{Correct, Ambiguous, Incorrect}` from its ColBERT score (`correct_threshold=14.44`, `ambiguous_threshold=8.0`); action `Correct` as soon as one document clears the upper threshold (CRAG §4.3). Modes: `signal` (default — label and report, never delete; with paper-scoped retrieval and no web fallback, deletion is pure recall loss), `refine` (Ambiguous docs reduced to the sentence strips that ColBERT scores ≥ the ambiguous threshold, recomposed in order), `legacy` (old filtering + lexical strips + top-5 fallback, for ablations).
 
 **Stage 4 — Generation (`src/generation/llm_generator.py`)**
-`LocalLLMGenerator` supports three backends resolved at init: `transformers` (HuggingFace pipeline, GPU), `ollama` (local HTTP daemon, CPU), and `vllm` (OpenAI-compatible server). Prompt template is loaded from `configs/prompts.yaml`; inline fallback if missing. Tracks per-call latency and approximate token counts.
+Kept chunks are trimmed to `--max-context-tokens` (lowest-ranked dropped first) and presented in paper order (order-preserving RAG; `--context-order rank` for the old behaviour). Blocks are `[Doc N] <chunk text>` — no paper ID or scores. `LocalLLMGenerator` supports `transformers`, `ollama` and `vllm` backends. Prompt template from `configs/prompts.yaml` (short cited answers, multi-excerpt synthesis, narrow refusal rule); inline fallback if missing.
 
-**Ingestion (`src/pipeline_ingest.py`, `src/retrieval/`)**
-`QasperChunker` splits papers into 500-token chunks with 10% overlap and a contextual prefix (`Title: ... Section: ...`). `DenseIndexer` builds a FAISS `IndexFlatIP` and saves the chunk metadata pickle. `SparseIndexer` builds a BM25 model with NLTK tokenization (LaTeX stripping + stop-word removal + Porter stemming). Both indices must always be rebuilt together to keep metadata aligned.
+**Ingestion (`src/pipeline_ingest.py`, `src/retrieval/`, `src/data/arxiv_tables.py`)**
+`QasperChunker` emits, in reading order (`position`): the abstract, every full-text paragraph (500-token chunks, 10% overlap), and one chunk per table/figure caption (`chunk_type` table/figure). When `data/table_bodies.json` exists (built by `src/data/arxiv_tables.py` from the papers' arXiv LaTeX `tabular` environments, cached in `data/arxiv_src/`), table chunks carry the Markdown table body, split row-wise with the caption and header repeated. All chunks keep the contextual prefix (`Title: ... Section: ...`). `DenseIndexer` builds a FAISS `IndexFlatIP` and saves the chunk metadata pickle. `SparseIndexer` builds a BM25 model with NLTK tokenization (LaTeX stripping + stop-word removal + Porter stemming). Both indices must always be rebuilt together to keep metadata aligned.
 
 **Evaluation (`src/evaluation/`)**
-`generate_predictions.py` runs the RAG pipeline over QASPER questions and writes `data/evaluation_dataset.csv`. `evaluate_rag.py` scores with **Prometheus 2** (`prometheus-eval/prometheus-7b-v2.0`, Kim et al. 2024 arXiv:2405.01535) using the ABSOLUTE_PROMPT rubric format — replaces `nomic-ai/nomic-embed-text-v1.5` and RAGAS. Four metrics are computed (context precision/recall, faithfulness, answer relevancy) plus ALCE citation precision/recall/F1. `calibrate_crag.py` finds optimal CRAG thresholds from a completed evaluation report.
+`generate_predictions.py` runs the RAG pipeline over QASPER questions and writes `data/evaluation_dataset.csv` (including `context_ranks`, `context_types`, `crag_action`, `pipeline_config`). `evaluate_rag.py` scores with **Prometheus 2** (`prometheus-eval/prometheus-7b-v2.0`, Kim et al. 2024 arXiv:2405.01535) for the rubric metrics (context precision on the top-3 *by rank*, answer relevancy, answer correctness). Sentence-level support checks go through `grounding.py::GroundingJudge` — `--grounding-checker hybrid` (default) uses Prometheus True/False prompts for context recall and **MiniCheck-Flan-T5-Large** (in-process) for faithfulness and ALCE citation precision/recall, the split that agreed best with independent labels (`compare_grounding_checkers.py`). Recall and faithfulness consider every context the generator saw. `evaluate_retrieval.py` measures evidence recall against QASPER gold evidence for a grid of context-selection configs without any LLM. `calibrate_crag.py` finds optimal CRAG thresholds from a completed evaluation report.
 
 ## Important Implementation Details
 
@@ -104,8 +115,8 @@ Classifies each document as `{Correct, Ambiguous, Incorrect}` using ColBERT MaxS
 
 **RAGatouille / LangChain shim:** `src/retrieval/reranker.py` injects stub modules at `langchain.retrievers.*` before importing RAGatouille 0.0.9.x, which expects a pre-1.0 LangChain path removed in LangChain 1.0. This shim must be imported before any RAGatouille usage.
 
-**Evaluation GPU strategy (two-phase sequential):** `run_evaluation.sh` starts Llama 3.1-8B on port 8000 for prediction generation, kills it after `generate_predictions.py` completes, then starts Prometheus 2-7B on port 8001 for evaluation. This sequential approach is required on single-GPU deployments (RTX 4090, 24 GB VRAM — each 7-8B model takes ~14-16 GB). `evaluate_rag.py` auto-selects backend: vLLM server (port `PROMETHEUS_PORT`) → HF transformers pipeline → Ollama (CPU fallback).
+**Evaluation GPU strategy (two-phase sequential):** `run_evaluation.sh` starts Llama 3.1-8B on port 8000 for prediction generation (`--max-model-len ${GEN_MAX_MODEL_LEN:-12288}`), kills it after `generate_predictions.py` completes, then starts Prometheus 2-7B on port 8001 for evaluation (`${EVAL_MAX_MODEL_LEN:-8192}`; 7 GiB of VRAM is reserved for in-process MiniCheck — bfloat16, length-aware batching, peak ≈ 3.2 GiB — unless `GROUNDING_CHECKER=prometheus`). `SKIP_GENERATION=1` reuses `data/evaluation_dataset.csv`; `EVAL_ARGS="--skip-alce"` resumes an evaluation whose ALCE pass already finished. The script never passes `--hf-token` to vLLM (vLLM logs its arguments); the token comes from the environment. This sequential approach is required on single-GPU deployments (RTX 4090, 24 GB VRAM — each 7-8B model takes ~14-16 GB). `evaluate_rag.py` auto-selects backend: vLLM server (port `PROMETHEUS_PORT`) → HF transformers pipeline → Ollama (CPU fallback).
 
-**Index format:** `dense.index.meta` and `sparse.pkl` are pickled Python objects. `sparse.pkl` is `{'model': BM25Okapi, 'metadata': [{'text': str, 'paper_id': str, ...}]}`. Both share the same chunk ordering — never swap one without rebuilding the other.
+**Index format:** `dense.index.meta` and `sparse.pkl` are pickled Python objects. `sparse.pkl` is `{'model': BM25Okapi, 'metadata': [{'text': str, 'paper_id': str, 'chunk_id': str, 'chunk_type': str, 'position': int, ...}]}`. Both share the same chunk ordering — never swap one without rebuilding the other. Indices built before 2026-10 lack `chunk_type`/`position`; paper order then falls back to parsing `chunk_id`. `data/indices_text_only/` keeps the pre-2026-10 text-only index for before/after comparisons.
 
 **FAISS:** not installable via pip for GPU support; must use the conda channel. The `requirements.txt` pip entry is kept only as a reference.

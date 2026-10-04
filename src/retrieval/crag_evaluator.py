@@ -30,7 +30,7 @@ not available, we use ColBERT v2 MaxSim reranker scores with:
 import re
 import logging
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -65,14 +65,31 @@ class CRAGEvaluator:
       - Raise correct_threshold to be stricter (fewer docs marked Correct).
       - Lower ambiguous_threshold to rescue borderline docs from Incorrect.
       - Raise consistency_ratio to require broader agreement among top docs.
+
+    Modes (key_metrics_improvements.md, 2026-10-03 review, P3):
+
+      - "signal" (default): classify and report the action, but never remove
+        or rewrite a document. Retrieval is scoped to the one paper that holds
+        the answer and there is no external (web) source to switch to, so in
+        CRAG's own terms (§4.3) there is nothing to *correct towards*; deleting
+        in-paper chunks on a weak evaluator's say-so is pure recall loss.
+      - "refine": like "signal", plus decompose-then-recompose of Ambiguous
+        documents (§4.4), with strips scored by the *same* ColBERT evaluator
+        (``strip_scorer``) and recomposed in their original order.
+      - "legacy": the pre-2026-10 behaviour (drop Incorrect docs, lexical strip
+        filter, consistency_ratio gate). Kept for ablations only.
     """
+
+    MODES = ("signal", "refine", "legacy")
 
     def __init__(
         self,
         correct_threshold: float = 14.0,
         ambiguous_threshold: float = 8.0,
-        consistency_ratio: float = 0.3,
+        consistency_ratio: float = 0.0,
         min_strip_query_overlap: int = 2,
+        mode: str = "signal",
+        strip_scorer: Optional[Callable[[str, List[str]], List[float]]] = None,
     ):
         """
         Args:
@@ -81,16 +98,26 @@ class CRAGEvaluator:
             ambiguous_threshold: Score between this and correct_threshold is labeled
                                  'Ambiguous'. Below this is 'Incorrect'. Default 8.0.
             consistency_ratio: Minimum fraction of top-k documents labeled 'Correct'
-                               for the overall CRAG action to be 'Correct'
-                               (self-consistency signal). Default 0.3.
+                               for the overall CRAG action to be 'Correct'.
+                               Default 0.0 = CRAG's own rule (Yan et al. 2024
+                               §4.3): Correct as soon as one document clears the
+                               upper threshold. The legacy setting was 0.3.
             min_strip_query_overlap: Minimum number of shared terms between a
                                     knowledge strip and the query for the strip
-                                    to survive refinement (Section 3.2). Default 2.
+                                    to survive refinement (legacy mode only). Default 2.
+            mode: "signal" | "refine" | "legacy" (see class docstring).
+            strip_scorer: callable(query, strips) -> scores, on the same scale as
+                          the document thresholds (ColBERT MaxSim). Required for
+                          "refine"; without it Ambiguous docs are kept intact.
         """
+        if mode not in self.MODES:
+            raise ValueError(f"Unknown CRAG mode '{mode}'. Choose from {self.MODES}.")
         self.correct_threshold = correct_threshold
         self.ambiguous_threshold = ambiguous_threshold
         self.consistency_ratio = consistency_ratio
         self.min_strip_query_overlap = min_strip_query_overlap
+        self.mode = mode
+        self.strip_scorer = strip_scorer
 
     # ------------------------------------------------------------------
     # Section 3.1 — Retrieval evaluator
@@ -238,9 +265,53 @@ class CRAGEvaluator:
 
         return refined
 
+    def refine_with_scorer(self, query: str, documents: List[Dict]) -> List[Dict]:
+        """
+        Non-destructive knowledge refinement ("refine" mode, CRAG §4.4).
+
+        Every document is kept. Ambiguous documents with more than two strips
+        are decomposed into sentences, each strip is scored by
+        ``strip_scorer`` (the same ColBERT evaluator that labelled the
+        document), strips below ``ambiguous_threshold`` are dropped, and the
+        survivors are recomposed *in their original order*. The best strip is
+        always kept, and the chunk's "Title: … Section: …" header is preserved.
+        """
+        if self.strip_scorer is None:
+            logger.warning("CRAG refine mode without a strip_scorer — keeping documents intact.")
+            return list(documents)
+
+        refined = []
+        for doc in documents:
+            if doc.get('crag_label') != 'Ambiguous':
+                refined.append(doc)
+                continue
+            header, body = self._split_header(doc.get('text', ''))
+            strips = self._decompose_to_strips(body)
+            # CRAG §4.4: a result of one or two sentences is a single strip.
+            if len(strips) <= 2:
+                refined.append(doc)
+                continue
+            scores = self.strip_scorer(query, strips)
+            best = int(np.argmax(scores))
+            kept = [s for i, (s, sc) in enumerate(zip(strips, scores))
+                    if sc >= self.ambiguous_threshold or i == best]
+            refined_doc = doc.copy()
+            refined_doc['text'] = (header + ' '.join(kept)) if header else ' '.join(kept)
+            refined_doc['refined'] = len(kept) < len(strips)
+            refined.append(refined_doc)
+        return refined
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _split_header(text: str) -> Tuple[str, str]:
+        """Separate the chunker's 'Title: … Section: …' first line from the body."""
+        if text.startswith('Title:') and '\n' in text:
+            header, body = text.split('\n', 1)
+            return header + '\n', body
+        return '', text
 
     def _decompose_to_strips(self, text: str) -> List[str]:
         """Decompose document text into sentence-level knowledge strips."""
@@ -282,8 +353,10 @@ class CRAGEvaluator:
 
         Returns:
             action (str): 'Correct', 'Ambiguous', or 'Incorrect'
-            refined_docs (list): filtered/refined documents for generation
-                                 (empty list when action is 'Incorrect')
+            refined_docs (list): documents for generation. In "signal" and
+                                 "refine" mode this is every input document;
+                                 in "legacy" mode it is filtered (and empty
+                                 when action is 'Incorrect').
             details (dict): diagnostic info including per-label counts,
                             self-consistency ratio, and score statistics
         """
@@ -294,12 +367,17 @@ class CRAGEvaluator:
         action, details = self.determine_action(documents)
 
         # Step 3: Knowledge refinement (Section 3.2)
-        if action in ('Correct', 'Ambiguous'):
+        if self.mode == 'signal':
+            refined = list(documents)
+        elif self.mode == 'refine':
+            refined = self.refine_with_scorer(query, documents)
+        elif action in ('Correct', 'Ambiguous'):
             refined = self.refine_knowledge(query, documents)
         else:
             refined = []
 
         details['action'] = action
+        details['mode'] = self.mode
         details['n_refined_docs'] = len(refined)
 
         return action, refined, details

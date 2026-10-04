@@ -217,8 +217,10 @@ def expand_to_atomic_units(
 
         # ── context_recall ──────────────────────────────────────────────────
         cr_items = judge._score_context_recall_items(question, contexts, ground_truth)
+        # The judge sees every context (batched for Prometheus; see
+        # PrometheusJudge._passage_batches), so the labeller does too.
         ctx_block = "\n---\n".join(
-            f"[Passage {i + 1}] {c}" for i, c in enumerate(contexts[:10])
+            f"[Passage {i + 1}] {c}" for i, c in enumerate(contexts)
         )
         for k, (gt_sentence, decision) in enumerate(cr_items):
             records.append({
@@ -236,9 +238,7 @@ def expand_to_atomic_units(
 
         # ── faithfulness ─────────────────────────────────────────────────────
         faith_items = judge._score_faithfulness_items(question, answer, contexts)
-        faith_ctx_block = "\n---\n".join(
-            f"[Passage {i + 1}] {c}" for i, c in enumerate(contexts[:5])
-        )
+        faith_ctx_block = ctx_block
         for k, (claim_sentence, decision) in enumerate(faith_items):
             records.append({
                 "unit_id": f"{row_idx}-faithfulness-{k}",

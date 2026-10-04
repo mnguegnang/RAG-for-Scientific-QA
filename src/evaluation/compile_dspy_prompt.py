@@ -20,17 +20,19 @@ save/load round-trip is defined for the base Module, not a Refine wrapper
 around it).
 
 GPU cost (stated explicitly, not hidden): each ALCE metric call runs one or
-more live Prometheus NLI calls (evaluate_rag.py::check_nli_entailment) per
-answer sentence, so a real --metric alce compile needs BOTH the Llama vLLM
-server (dspy.LM generating candidate answers) and a reachable Prometheus
-backend (get_prometheus_judge() — vLLM/HF/Ollama) available *at the same
-time*. CLAUDE.md documents Llama and Prometheus as normally sequential on a
-single GPU specifically to avoid OOM (run_evaluation.sh stops Llama before
-starting Prometheus) — running both together needs enough combined VRAM, or
-pointing PROMETHEUS_PORT at a Prometheus instance on a separate GPU/process.
-Check headroom before a real compile; --metric citation-format remains
-available as a no-judge-call fallback (format/stuffing only, not semantic
-claim-to-citation correctness) if that headroom isn't there.
+more entailment checks per answer sentence. With the default
+--grounding-checker minicheck those run in-process on MiniCheck-Flan-T5
+(~3 GB, fp32) next to the Llama vLLM server, which fits on one 24 GB GPU.
+With --grounding-checker prometheus a real compile needs BOTH the Llama vLLM
+server and a reachable Prometheus backend *at the same time* — CLAUDE.md
+documents those as normally sequential on a single GPU to avoid OOM, so that
+needs enough combined VRAM or PROMETHEUS_PORT pointed at another GPU.
+--metric citation-format remains available as a no-judge-call fallback
+(format/stuffing only, not semantic claim-to-citation correctness).
+
+Training examples are retrieved through ScientificRAGPipeline.retrieve_context
+with the same context-selection flags as generate_predictions.py, so pass the
+same --context-k / --crag-mode / ... values you evaluate with.
 
 Usage:
     # Real compile, Finding #5's ALCE/Prometheus metric (needs Llama vLLM
@@ -54,7 +56,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 import dspy
 import nltk
 
-from src.evaluation.evaluate_rag import ALCEEvaluator, get_prometheus_judge
+from src.evaluation.evaluate_rag import GROUNDING_CHECKERS, ALCEEvaluator, get_prometheus_judge
+from src.evaluation.grounding import MiniCheckJudge
+from src.run_rag import add_pipeline_args, pipeline_kwargs
 from src.evaluation.generate_predictions import fetch_qasper_sample
 from src.generation.dspy_module import (
     DEFAULT_PAPER_FOCUS_HINT,
@@ -123,63 +127,35 @@ def fetch_disjoint_train_sample(
 
 def build_retrieval_components(
     dense_index_path: str, dense_meta_path: str, sparse_index_path: str,
-    crag_correct_threshold: float, crag_ambiguous_threshold: float,
-    crag_consistency_ratio: float,
+    pipeline_config: Optional[dict] = None,
 ):
     """
-    Instantiates the same retrieval/rerank/CRAG stack run_rag.py's
-    ScientificRAGPipeline uses (stages 1-3 only, no generator) — kept
-    separate from ScientificRAGPipeline itself so this stays purely additive
-    (no changes to run_rag.py needed for this script to work). Mirrors the
-    pattern already used by calibrate_crag.py::_collect_reranker_scores.
+    The live pipeline's stages 1-3 (ScientificRAGPipeline with
+    load_generator=False), so training examples see exactly the context shape
+    live queries do: same ranking, CRAG mode, context_k, token budget and
+    paper-order presentation.
     """
-    from src.retrieval.crag_evaluator import CRAGEvaluator
-    from src.retrieval.hybrid_retriever import HybridRetriever
-    from src.retrieval.reranker import ColBERTv2Reranker
-
-    retriever = HybridRetriever(
+    from src.run_rag import ScientificRAGPipeline
+    return ScientificRAGPipeline(
         dense_index_path=dense_index_path,
         dense_meta_path=dense_meta_path,
         sparse_index_path=sparse_index_path,
+        load_generator=False,
+        **(pipeline_config or {}),
     )
-    reranker = ColBERTv2Reranker(model_name="colbert-ir/colbertv2.0")
-    crag_evaluator = CRAGEvaluator(
-        correct_threshold=crag_correct_threshold,
-        ambiguous_threshold=crag_ambiguous_threshold,
-        consistency_ratio=crag_consistency_ratio,
-    )
-    return retriever, reranker, crag_evaluator
 
 
-def retrieve_docs_for_question(
-    retriever, reranker, crag_evaluator, question: str, paper_id: str
-) -> List[Dict]:
-    """Stages 1-3 of run_rag.py::ScientificRAGPipeline.ask, no generation.
-
-    Mirrors run_rag.py's own 'Incorrect' fallback (top-5 by rerank score)
-    exactly, so training examples see the same context shape live queries do.
-    Deliberately skips HyDE (documented simplification — see module
-    docstring) to avoid needing a live LM for the retrieval stage itself.
-    """
-    broad = retriever.search(question, k=100, filter_paper_id=paper_id)
-    if not broad:
-        return []
-    top_docs = reranker.rerank(question, broad, top_k=10)
-    action, refined, _details = crag_evaluator.evaluate_and_refine(question, top_docs)
-    if action == "Incorrect":
-        refined = sorted(
-            top_docs, key=lambda d: d.get("rerank_score", 0.0), reverse=True
-        )[:5]
-    return refined
+def retrieve_docs_for_question(pipeline, question: str, paper_id: str) -> List[Dict]:
+    """Stages 1-3 of ScientificRAGPipeline, no generation. HyDE is skipped
+    (no LM at this stage; documented simplification — see module docstring)."""
+    return pipeline.retrieve_context(question, filter_paper_id=paper_id, use_hyde=False)["docs"]
 
 
-def build_trainset(qa_pairs: List[Dict], retriever, reranker, crag_evaluator) -> List[dspy.Example]:
+def build_trainset(qa_pairs: List[Dict], pipeline) -> List[dspy.Example]:
     examples = []
     n_empty = 0
     for i, qa in enumerate(qa_pairs):
-        docs = retrieve_docs_for_question(
-            retriever, reranker, crag_evaluator, qa["question"], qa.get("paper_id")
-        )
+        docs = retrieve_docs_for_question(pipeline, qa["question"], qa.get("paper_id"))
         if not docs:
             n_empty += 1
             continue
@@ -392,14 +368,12 @@ def run_smoke_test() -> None:
     assert len(train_sample) == 5
 
     logging.info("[smoke] real retrieval for %d training questions (no LLM)...", 2)
-    retriever, reranker, crag_evaluator = build_retrieval_components(
+    pipeline = build_retrieval_components(
         dense_index_path=str(_PROJECT_ROOT / "data" / "indices" / "dense.index"),
         dense_meta_path=str(_PROJECT_ROOT / "data" / "indices" / "dense.index.meta"),
         sparse_index_path=str(_PROJECT_ROOT / "data" / "indices" / "sparse.pkl"),
-        crag_correct_threshold=14.0, crag_ambiguous_threshold=8.0,
-        crag_consistency_ratio=0.3,
     )
-    trainset = build_trainset(train_sample[:2], retriever, reranker, crag_evaluator)
+    trainset = build_trainset(train_sample[:2], pipeline)
     assert len(trainset) >= 1, "Expected at least 1 real training example with non-empty retrieval."
 
     logging.info("[smoke] compiling with DummyLM (no live vLLM call)...")
@@ -465,9 +439,12 @@ def main() -> None:
                         default=str(_PROJECT_ROOT / "data" / "indices" / "dense.index.meta"))
     parser.add_argument("--sparse-index", type=str,
                         default=str(_PROJECT_ROOT / "data" / "indices" / "sparse.pkl"))
-    parser.add_argument("--crag-correct", type=float, default=14.0)
-    parser.add_argument("--crag-ambiguous", type=float, default=8.0)
-    parser.add_argument("--crag-consistency", type=float, default=0.3)
+    add_pipeline_args(parser)
+    parser.add_argument(
+        "--grounding-checker", choices=GROUNDING_CHECKERS,
+        default=os.environ.get("GROUNDING_CHECKER", "hybrid"),
+        help="Entailment judge behind the 'alce' metric; hybrid and minicheck both "
+             "use MiniCheck for ALCE (default: hybrid).")
     parser.add_argument("--model-id", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--api-base", type=str,
                         default=os.environ.get("VLLM_API_URL", "http://localhost:8000/v1"))
@@ -501,14 +478,11 @@ def main() -> None:
         num_samples=args.n_train, train_seed=args.train_seed,
         eval_seed=args.eval_seed, eval_num_samples=args.eval_num_samples,
     )
-    retriever, reranker, crag_evaluator = build_retrieval_components(
+    pipeline = build_retrieval_components(
         dense_index_path=args.dense_index, dense_meta_path=args.dense_meta,
-        sparse_index_path=args.sparse_index,
-        crag_correct_threshold=args.crag_correct,
-        crag_ambiguous_threshold=args.crag_ambiguous,
-        crag_consistency_ratio=args.crag_consistency,
+        sparse_index_path=args.sparse_index, pipeline_config=pipeline_kwargs(args),
     )
-    trainset = build_trainset(train_sample, retriever, reranker, crag_evaluator)
+    trainset = build_trainset(train_sample, pipeline)
     if not trainset:
         raise RuntimeError("No training examples with non-empty retrieval — aborting compile.")
 
@@ -517,8 +491,11 @@ def main() -> None:
             "Using ALCE/Prometheus metric (Finding #5) — requires a reachable "
             "Prometheus backend alongside the Llama vLLM server. Loading judge..."
         )
-        judge, _is_gpu = get_prometheus_judge()
-        metric_fn = build_alce_metric(ALCEEvaluator(judge))
+        if args.grounding_checker in ("minicheck", "hybrid"):
+            grounding = MiniCheckJudge()   # in-process; no Prometheus server needed
+        else:
+            grounding, _is_gpu = get_prometheus_judge()
+        metric_fn = build_alce_metric(ALCEEvaluator(grounding))
     else:
         logging.info("Using deterministic citation-format metric (no judge calls).")
         metric_fn = citation_format_metric

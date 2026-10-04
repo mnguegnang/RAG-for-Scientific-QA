@@ -16,8 +16,9 @@ Dataset context (QASPER):
 
 ALCE citation metrics:
     Gao et al. (2023). Enabling Large Language Models to Generate Text with
-    Citations. EMNLP 2023. §4.1 — Citation Precision and Recall via NLI
-    entailment, backed by Prometheus 2.
+    Citations. EMNLP 2023. §3.3 — Citation Precision and Recall via NLI
+    entailment, decided by the configured grounding checker (MiniCheck by
+    default, see src/evaluation/grounding.py and --grounding-checker).
 
 Prometheus 2 RAG metrics:
     Kim et al. (2024). Prometheus 2: An Open Source Language Model Specialized
@@ -60,6 +61,8 @@ from typing import List, Optional, Tuple
 import nltk
 import pandas as pd
 import torch
+
+from src.evaluation.grounding import GroundingJudge, MiniCheckJudge
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -230,7 +233,7 @@ _RUBRICS: dict = {
 
 # ── Prometheus 2 judge ────────────────────────────────────────────────────────
 
-class PrometheusJudge:
+class PrometheusJudge(GroundingJudge):
     """
     RAG evaluation judge backed by Prometheus 2.
 
@@ -254,6 +257,7 @@ class PrometheusJudge:
         2023 §4.1).
     """
 
+    name = "prometheus"
     MODEL_ID = "prometheus-eval/prometheus-7b-v2.0"
     _SCORE_RE = re.compile(r"\[RESULT\]\s*(\d)", re.IGNORECASE)
 
@@ -399,171 +403,97 @@ class PrometheusJudge:
             rubric=_RUBRICS["context_precision"],
         ))
 
-    def _score_context_recall_items(
-        self, question: str, contexts: List[str], ground_truth: str
-    ) -> List[Tuple[str, bool]]:
+    # ── Grounding primitive (GroundingJudge) ──────────────────────────────────
+    # Context recall, faithfulness and ALCE entailment share the metric logic
+    # in src/evaluation/grounding.py::GroundingJudge; Prometheus answers the
+    # underlying "is this sentence supported?" question with a direct
+    # True/False prompt (not ABSOLUTE_PROMPT — see Project_Note.md Issue 5).
+
+    # Passages are sent in batches no larger than this, so a prompt never
+    # overflows the judge server's window (run_evaluation.sh serves Prometheus
+    # with --max-model-len EVAL_MAX_MODEL_LEN). ~9000 chars is ~2.3K tokens.
+    # "Supported by at least one passage" is unchanged by batching.
+    PASSAGE_BUDGET_CHARS = 9000
+
+    _PROMPTS = {
+        "recall": (
+            "You are a scientific RAG evaluator.\n"
+            "Retrieved passages:\n{passages}\n\n"
+            "Ground-truth sentence: {claim}\n\n"
+            "Does at least one retrieved passage directly support this "
+            "ground-truth sentence? "
+            "Answer with exactly one word: True or False."
+        ),
+        "faithfulness": (
+            "Retrieved passages:\n{passages}\n\n"
+            "Claim from generated answer: {claim}\n\n"
+            "Is this claim directly supported by at least one of the "
+            "retrieved passages? "
+            "Answer with exactly one word: True or False."
+        ),
+        # Direct binary NLI prompt for ALCE (Gao et al. 2023 §3.3: entailment
+        # is binary). Numerical format equivalence: "84.3%" == "0.843".
+        "nli": (
+            "You are an NLI judge for scientific text. "
+            "Determine whether the document passage below supports the claim. "
+            "Paraphrasing and implicit support both count; exact wording is not "
+            "required. For numerical claims, percentage and decimal formats are "
+            "equivalent ('84.3%' and '0.843' express the same value).\n\n"
+            "Document passage:\n{passages}\n\n"
+            "Claim: {claim}\n\n"
+            "Does the document passage support the claim? "
+            "Answer with exactly one word: True or False."
+        ),
+    }
+
+    @classmethod
+    def _passage_batches(cls, passages: List[str]) -> List[str]:
+        """'[Passage i] ...' blocks (each passage capped at 1500 chars) grouped
+        into batches of at most PASSAGE_BUDGET_CHARS; numbering is global."""
+        batches, current, size = [], [], 0
+        for i, passage in enumerate(passages):
+            block = f"[Passage {i + 1}] {passage[:1500]}"
+            if current and size + len(block) > cls.PASSAGE_BUDGET_CHARS:
+                batches.append("\n---\n".join(current))
+                current, size = [], 0
+            current.append(block)
+            size += len(block) + 5
+        if current:
+            batches.append("\n---\n".join(current))
+        return batches
+
+    @staticmethod
+    def _parse_true_false(text: str, kind: str) -> bool:
         """
-        Atomic per-sentence judgments backing score_context_recall.
-
-        Returns [(gt_sentence, supported), ...] — one entry per ground-truth
-        sentence, in order. Empty list if no GT sentences or no contexts are
-        available (mirrors the nan-triggering conditions of the wrapper).
+        True/False (yes/no fallback); then prose verdicts such as "the sentence
+        is directly supported by Passage 3" (seen in practice — previously
+        these fell through to False, a silent false negative). Negated
+        phrasings are checked before affirmative ones. Anything else is False.
         """
-        if not contexts or not ground_truth:
-            return []
+        for pattern, value in ((r"\bTrue\b", True), (r"\bFalse\b", False),
+                               (r"\byes\b", True), (r"\bno\b", False),
+                               (r"\b(?:not|never|cannot|n't)\b[^.]{0,40}\bsupport", False),
+                               (r"\bunsupported\b", False),
+                               (r"\b(?:is|are|directly|fully|clearly)\s+supported\b|\bsupports\b", True)):
+            if re.search(pattern, text, re.IGNORECASE):
+                return value
+        logging.warning("[%s] Could not parse True/False from: %.80s", kind, text)
+        return False
 
-        ctx_block = "\n---\n".join(
-            f"[Passage {i + 1}] {c[:1500]}" for i, c in enumerate(contexts[:10])
-        )
-
-        gt_sentences = [s for s in nltk.sent_tokenize(ground_truth) if len(s) >= 10]
-        if not gt_sentences:
-            return []
-
-        items = []
-        for gt_sent in gt_sentences:
-            prompt = (
-                "You are a scientific RAG evaluator.\n"
-                "Retrieved passages:\n" + ctx_block + "\n\n"
-                "Ground-truth sentence: " + gt_sent + "\n\n"
-                "Does at least one retrieved passage directly support this "
-                "ground-truth sentence? "
-                "Answer with exactly one word: True or False."
-            )
-            text = self._generate(prompt).strip()
-
-            if re.search(r"\bTrue\b", text, re.IGNORECASE):
-                result = True
-            elif re.search(r"\bFalse\b", text, re.IGNORECASE):
-                result = False
-            elif re.search(r"\byes\b", text, re.IGNORECASE):
-                result = True
-            elif re.search(r"\bno\b", text, re.IGNORECASE):
-                result = False
-            else:
-                logging.warning(
-                    "[ContextRecall] Could not parse True/False from: %.80s", text
-                )
-                result = False
-
-            logging.debug(
-                "[ContextRecall] GT sentence %r → %s", gt_sent[:60], result
-            )
-            items.append((gt_sent, result))
-
-        return items
-
-    def score_context_recall(self, question: str, contexts: List[str],
-                             ground_truth: str) -> float:
-        """
-        Coverage of the ground-truth answer by all retrieved passages.
-
-        Implements sentence-level attribution: each ground-truth sentence is
-        checked independently via a binary True/False NLI prompt against the
-        full set of retrieved passages.  The metric is the fraction of GT
-        sentences supported by at least one passage.
-
-        Reference:
-            Es et al. (2023). RAGAS: Automated Evaluation of Retrieval
-            Augmented Generation Systems. §3.2, Definition 3 — sentence-level
-            attribution loop: recall = |{s ∈ GT : ∃p ∈ C, p supports s}| / |GT|.
-
-        Returns float in [0.0, 1.0], or float("nan") if no GT sentences or no
-        contexts are available.
-        """
-        items = self._score_context_recall_items(question, contexts, ground_truth)
-        if not items:
-            return float("nan")
-        return sum(r for _, r in items) / len(items)
-
-    def _score_faithfulness_items(
-        self, question: str, answer: str, contexts: List[str]
-    ) -> List[Tuple[str, bool]]:
-        """
-        Atomic per-claim judgments backing score_faithfulness.
-
-        Returns [(claim_sentence, supported), ...] — one entry per claim
-        sentence in the generated answer (citation markers stripped), in
-        order. Skips sentences that are empty after stripping citation
-        markers. Empty list if no claim sentences or no contexts are
-        available (mirrors the nan-triggering conditions of the wrapper).
-        """
-        if not contexts or not answer:
-            return []
-
-        ctx_block = "\n---\n".join(
-            f"[Passage {i + 1}] {c[:1500]}" for i, c in enumerate(contexts[:5])
-        )
-
-        raw_sentences = nltk.sent_tokenize(answer)
-        claim_sentences = [s for s in raw_sentences if len(s) >= 15]
-        if not claim_sentences:
-            return []
-
-        items = []
-        for sent in claim_sentences:
-            clean_sent = re.sub(
-                r"\[Doc \d+(?:,\s*Doc \d+)*\]", "", sent
-            ).strip()
-            if not clean_sent:
-                # Preserve original denominator behavior: counted as
-                # unsupported without an NLI call (nothing left to check).
-                items.append((sent, False))
-                continue
-
-            prompt = (
-                "Retrieved passages:\n" + ctx_block + "\n\n"
-                "Claim from generated answer: " + clean_sent + "\n\n"
-                "Is this claim directly supported by at least one of the "
-                "retrieved passages? "
-                "Answer with exactly one word: True or False."
-            )
-            text = self._generate(prompt).strip()
-
-            if re.search(r"\bTrue\b", text, re.IGNORECASE):
-                result = True
-            elif re.search(r"\bFalse\b", text, re.IGNORECASE):
-                result = False
-            elif re.search(r"\byes\b", text, re.IGNORECASE):
-                result = True
-            elif re.search(r"\bno\b", text, re.IGNORECASE):
-                result = False
-            else:
-                logging.warning(
-                    "[Faithfulness] Could not parse True/False from: %.80s", text
-                )
-                result = False
-
-            logging.debug(
-                "[Faithfulness] Claim %r → %s", clean_sent[:60], result
-            )
-            items.append((clean_sent, result))
-
-        return items
-
-    def score_faithfulness(self, question: str, answer: str,
-                           contexts: List[str]) -> float:
-        """
-        Degree to which the generated answer is grounded in retrieved contexts.
-
-        Implements per-claim binary NLI: each sentence from the generated answer
-        is treated as a distinct claim and verified independently against the
-        retrieved passages via a True/False prompt.  The metric is the fraction
-        of claims supported by at least one passage.
-
-        References:
-            Es et al. (2023). RAGAS §3.3, Definition 4 — per-claim grounding
-            check: faithfulness = |{c ∈ A : ∃p ∈ C, p supports c}| / |A|.
-            Zheng et al. (2023). MT-Bench §4.2 — single-criterion per call
-            yields more reliable binary judgements than holistic multi-claim prompts.
-
-        Returns float in [0.0, 1.0], or float("nan") if no claim sentences or
-        no contexts are available.
-        """
-        items = self._score_faithfulness_items(question, answer, contexts)
-        if not items:
-            return float("nan")
-        return sum(r for _, r in items) / len(items)
+    def _supported(self, claim: str, passages: List[str],
+                   kind: str) -> Tuple[bool, Optional[str]]:
+        template = self._PROMPTS[kind]
+        if kind == "nli":
+            blocks = [passages[0][:self.PASSAGE_BUDGET_CHARS]]
+            claim = claim[:400]
+        else:
+            blocks = self._passage_batches(passages)
+        prompt = None
+        for block in blocks:
+            prompt = template.format(passages=block, claim=claim)
+            if self._parse_true_false(self._generate(prompt).strip(), kind):
+                return True, prompt
+        return False, prompt
 
     def score_answer_relevancy(self, question: str, answer: str) -> float:
         """
@@ -651,75 +581,20 @@ class PrometheusJudge:
             rubric=_RUBRICS["answer_correctness"],
         ))
 
-    def check_nli_entailment(self, claim: str, cited_text: str) -> Tuple[bool, Optional[str]]:
-        """
-        NLI entailment check for ALCE citation evaluation.
-
-        Fix 1: Replaces the ABSOLUTE_PROMPT-based rubric call with a direct
-        True/False binary prompt. ABSOLUTE_PROMPT expects a student response to
-        grade; passing a meta-statement ("Evaluating whether the document
-        entails...") in the `response` field confuses the model and produces
-        systematically low scores (1-2), making every NLI check return False
-        and collapsing ALCE to near zero.
-
-        This follows the original ALCE design (Gao et al. 2023, EMNLP 2023,
-        §4.1): entailment is binary — a cited passage either supports the claim
-        or it does not. Honovich et al. (2022) TRUE (NAACL 2022) formalises this
-        as binary NLI classification; we approximate it with a direct True/False
-        instruction to Prometheus 2.
-
-        Fix 2 also applied: context window raised from 1000 → 1500 chars so
-        the cited passage is not truncated before the supporting evidence.
-
-        Returns (result, prompt_used) — prompt_used is None on the short-circuit
-        paths (empty cited_text / empty claim) where no NLI call was made.
-        """
-        if not cited_text.strip():
-            return False, None
-        clean_claim = re.sub(r"\[Doc \d+(?:,\s*Doc \d+)*\]", "", claim).strip()
-        if not clean_claim:
-            return False, None
-
-        # Direct binary NLI prompt — bypasses ABSOLUTE_PROMPT entirely.
-        # Numerical format equivalence: "84.3%" and "0.843" are the same value.
-        prompt = (
-            "You are an NLI judge for scientific text. "
-            "Determine whether the document passage below supports the claim. "
-            "Paraphrasing and implicit support both count; exact wording is not "
-            "required. For numerical claims, percentage and decimal formats are "
-            "equivalent ('84.3%' and '0.843' express the same value).\n\n"
-            f"Document passage:\n{cited_text[:1500]}\n\n"
-            f"Claim: {clean_claim[:400]}\n\n"
-            "Does the document passage support the claim? "
-            "Answer with exactly one word: True or False."
-        )
-        text = self._generate(prompt).strip()
-
-        # Parse True/False case-insensitively; accept yes/no as fallback.
-        if re.search(r"\bTrue\b", text, re.IGNORECASE):
-            return True, prompt
-        if re.search(r"\bFalse\b", text, re.IGNORECASE):
-            return False, prompt
-        if re.search(r"\byes\b", text, re.IGNORECASE):
-            return True, prompt
-        if re.search(r"\bno\b", text, re.IGNORECASE):
-            return False, prompt
-        logging.warning("[NLI] Could not parse True/False from: %.80s", text)
-        return False, prompt
-
 
 # ── ALCE evaluator ────────────────────────────────────────────────────────────
 
 class ALCEEvaluator:
     """
-    ALCE Citation Precision and Recall with Prometheus 2 NLI.
+    ALCE Citation Precision and Recall, with entailment decided by a
+    GroundingJudge (MiniCheck or Prometheus 2; see grounding.py).
 
     Reference:
         Gao et al. (2023). Enabling Large Language Models to Generate Text
         with Citations. EMNLP 2023. §4 — citation precision and recall.
     """
 
-    def __init__(self, judge: PrometheusJudge):
+    def __init__(self, judge: GroundingJudge):
         self.judge = judge
         try:
             nltk.download("punkt", quiet=True)
@@ -885,9 +760,25 @@ def get_prometheus_judge() -> Tuple[PrometheusJudge, bool]:
 
 # ── Prometheus metric computation ─────────────────────────────────────────────
 
+def precision_contexts(contexts: List[str], ranks, n: int) -> List[str]:
+    """
+    The n best-RANKED contexts. Contexts are stored in the order the generator
+    saw them (paper order by default), so "top-3" must come from the
+    persisted rerank ranks, not from list position. Rows without valid ranks
+    (datasets generated before 2026-10) fall back to list order, which was
+    rank order then.
+    """
+    if isinstance(ranks, (list, tuple)) and len(ranks) == len(contexts) and \
+            all(isinstance(r, (int, float)) for r in ranks):
+        order = sorted(range(len(contexts)), key=lambda i: ranks[i])
+        return [contexts[i] for i in order[:n]]
+    return contexts[:n]
+
+
 def run_prometheus_metrics(df: pd.DataFrame, judge: PrometheusJudge,
                            is_gpu: bool,
-                           max_precision_contexts: int = 3) -> pd.DataFrame:
+                           max_precision_contexts: int = 3,
+                           grounding: Optional[dict] = None) -> pd.DataFrame:
     """
     Compute Prometheus 2 RAG metrics for all rows.
 
@@ -907,8 +798,12 @@ def run_prometheus_metrics(df: pd.DataFrame, judge: PrometheusJudge,
         metric bias (Liu et al. 2023 "Lost in the Middle" §3: LLMs primarily
         use the first few retrieved passages).
 
+    grounding: {"recall": GroundingJudge, "faithfulness": GroundingJudge, ...}
+        for the sentence-level support checks (default: *judge* for both).
+
     Returns a DataFrame of normalized [0.0, 1.0] scores indexed like df.
     """
+    grounding = grounding or {"recall": judge, "faithfulness": judge}
     records: List[dict] = []
     total = len(df)
 
@@ -923,11 +818,12 @@ def run_prometheus_metrics(df: pd.DataFrame, judge: PrometheusJudge,
         )
 
         # Context Precision: top-N chunks only (reduces API calls, see docstring)
-        precision_contexts = contexts[:max_precision_contexts]
-        if precision_contexts:
+        top_contexts = precision_contexts(contexts, row.get("context_ranks"),
+                                          max_precision_contexts)
+        if top_contexts:
             cp_scores = [
                 judge.score_context_precision(question, c)
-                for c in precision_contexts
+                for c in top_contexts
             ]
             valid_cp = [s for s in cp_scores if not pd.isna(s)]
             cp = sum(valid_cp) / len(valid_cp) if valid_cp else float("nan")
@@ -936,13 +832,13 @@ def run_prometheus_metrics(df: pd.DataFrame, judge: PrometheusJudge,
 
         # Context Recall: holistic score — all contexts vs QASPER ground truth
         cr = (
-            judge.score_context_recall(question, contexts, ground_truth)
+            grounding["recall"].score_context_recall(question, contexts, ground_truth)
             if contexts and ground_truth else float("nan")
         )
 
         # Faithfulness: scientific precision of claims against NLP paper passages
         faith = (
-            judge.score_faithfulness(question, answer, contexts)
+            grounding["faithfulness"].score_faithfulness(question, answer, contexts)
             if contexts and answer else float("nan")
         )
 
@@ -971,8 +867,40 @@ def run_prometheus_metrics(df: pd.DataFrame, judge: PrometheusJudge,
 
 # ── Main evaluation pipeline ──────────────────────────────────────────────────
 
+GROUNDING_CHECKERS = ("hybrid", "minicheck", "prometheus")
+
+
+def build_grounding_judges(name: str, prometheus_judge: "PrometheusJudge") -> dict:
+    """
+    Judges for the sentence-level support checks, per metric:
+    {"recall": ..., "faithfulness": ..., "alce": ...}.
+
+    "hybrid" (default) follows the measured agreement with independent labels
+    (compare_grounding_checkers.py, 132 units, 2026-10-03): MiniCheck agrees
+    better on answer-sentence checks (kappa: faithfulness 0.391 vs 0.292,
+    ALCE entailment 0.284 vs 0.229), Prometheus on ground-truth coverage
+    (context recall 0.565 vs 0.430). Re-run that script after relabelling and
+    revisit this split if the ordering changes.
+    """
+    if name == "prometheus":
+        return {"recall": prometheus_judge, "faithfulness": prometheus_judge,
+                "alce": prometheus_judge}
+    if name == "minicheck":
+        minicheck = MiniCheckJudge()
+        return {"recall": minicheck, "faithfulness": minicheck, "alce": minicheck}
+    if name == "hybrid":
+        minicheck = MiniCheckJudge()
+        return {"recall": prometheus_judge, "faithfulness": minicheck, "alce": minicheck}
+    raise ValueError(f"Unknown grounding checker '{name}'. Choose from {GROUNDING_CHECKERS}.")
+
+
+def describe_grounding(judges: dict) -> str:
+    return ",".join(f"{metric}={judge.name}" for metric, judge in judges.items())
+
+
 def run_evaluation(input_csv: str = None, output_csv: str = None,
-                   skip_alce: bool = False) -> None:
+                   skip_alce: bool = False,
+                   grounding_checker: str = "hybrid") -> None:
     _project_root = Path(__file__).resolve().parents[2]
     if input_csv is None:
         input_csv = str(_project_root / "data" / "evaluation_dataset.csv")
@@ -992,9 +920,16 @@ def run_evaluation(input_csv: str = None, output_csv: str = None,
             return []
 
     df["contexts"] = [_safe_parse_contexts(v, i) for i, v in enumerate(df["contexts"])]
+    if "context_ranks" in df.columns:
+        df["context_ranks"] = [_safe_parse_contexts(v, i) for i, v in enumerate(df["context_ranks"])]
 
-    # ── Build Prometheus 2 judge ──────────────────────────────────────────────
+    # ── Build judges ──────────────────────────────────────────────────────────
+    # Prometheus 2 grades the rubric metrics (precision, relevancy,
+    # correctness); the grounding checker decides sentence-level support for
+    # context recall, faithfulness and ALCE (key_metrics_improvements.md P1).
     judge, is_gpu = get_prometheus_judge()
+    grounding = build_grounding_judges(grounding_checker, judge)
+    logging.info("Grounding checkers: %s", describe_grounding(grounding))
 
     # ── Error / refusal masks ─────────────────────────────────────────────────
     error_answer_mask = df["answer"].str.contains(
@@ -1044,7 +979,7 @@ def run_evaluation(input_csv: str = None, output_csv: str = None,
         logging.info(
             "Running ALCE citation evaluation with Prometheus 2 NLI judge ..."
         )
-        alce_evaluator = ALCEEvaluator(judge=judge)
+        alce_evaluator = ALCEEvaluator(judge=grounding["alce"])
         precisions, recalls = [], []
         evaluable_rows = len(df) - skip_metrics_mask.sum()
         eval_counter = 0
@@ -1092,7 +1027,7 @@ def run_evaluation(input_csv: str = None, output_csv: str = None,
         )
 
     df_eval = df[~skip_prom_mask].reset_index(drop=True)
-    prom_df = run_prometheus_metrics(df_eval, judge, is_gpu)
+    prom_df = run_prometheus_metrics(df_eval, judge, is_gpu, grounding=grounding)
 
     # ── Per-row NaN retry ─────────────────────────────────────────────────────
     prom_metric_cols = list(prom_df.columns)
@@ -1101,7 +1036,7 @@ def run_evaluation(input_csv: str = None, output_csv: str = None,
         logging.info("Retrying %d rows that returned NaN ...", len(nan_rows))
         for retry_idx in nan_rows:
             row_df = df_eval.iloc[[retry_idx]].reset_index(drop=True)
-            retry_result = run_prometheus_metrics(row_df, judge, is_gpu)
+            retry_result = run_prometheus_metrics(row_df, judge, is_gpu, grounding=grounding)
             for col in prom_metric_cols:
                 val = retry_result.at[0, col]
                 if not pd.isna(val):
@@ -1126,6 +1061,7 @@ def run_evaluation(input_csv: str = None, output_csv: str = None,
     ].copy()
     for col in prom_metric_cols:
         final_df[col] = prom_aligned[col]
+    final_df["grounding_checker"] = describe_grounding(grounding)
 
     os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     final_df.to_csv(output_csv, index=False)
@@ -1149,7 +1085,15 @@ def run_evaluation(input_csv: str = None, output_csv: str = None,
         suffix = f"  [{', '.join(parts)}]" if parts else ""
         return f"{valid.mean():.4f}{suffix}"
 
+    n_answered = len(df) - n_error - n_refusal
     logging.info("\n========== PROMETHEUS 2 × QASPER EVALUATION REPORT ==========")
+    # Refusals and errors are excluded from every mean below, so a change that
+    # turns refusals into (harder) answered rows can lower a mean while
+    # improving the system. Read the means together with this coverage line.
+    logging.info("Answered coverage:       %d/%d (%.1f%%) — %d refusals, %d errors",
+                 n_answered, len(df), 100.0 * n_answered / max(1, len(df)),
+                 n_refusal, n_error)
+    logging.info("Grounding checkers:      %s", describe_grounding(grounding))
     logging.info("--- Retrieval metrics ---")
     logging.info("Context Precision:       %s",
                  _fmt(final_df.get("context_precision",    pd.Series(dtype=float))))
@@ -1181,9 +1125,17 @@ if __name__ == "__main__":
     )
     parser.add_argument("--input-csv",  type=str, default=None)
     parser.add_argument("--output-csv", type=str, default=None)
+    parser.add_argument(
+        "--grounding-checker", choices=GROUNDING_CHECKERS,
+        default=os.environ.get("GROUNDING_CHECKER", "hybrid"),
+        help="Judge for the support checks behind context recall / faithfulness / "
+             "ALCE. hybrid (default): Prometheus for recall, MiniCheck for "
+             "faithfulness and ALCE — see build_grounding_judges.",
+    )
     args = parser.parse_args()
     run_evaluation(
         input_csv=args.input_csv,
         output_csv=args.output_csv,
         skip_alce=args.skip_alce,
+        grounding_checker=args.grounding_checker,
     )

@@ -59,7 +59,33 @@ class ColBERTv2Reranker:
         """
         logger.info("Loading ColBERT v2 reranker: %s on device: %s", model_name, device)
         self.model = RAGPretrainedModel.from_pretrained(model_name)
+        # Optional (query, text) -> score memo. Off by default; the offline
+        # retrieval harness turns it on so sweeping many configurations over
+        # the same questions scores each chunk once.
+        self._cache = None
         logger.info("ColBERT v2 reranker ready.")
+
+    def enable_cache(self) -> None:
+        self._cache = {}
+
+    def score(self, query: str, texts: list) -> list:
+        """
+        ColBERT v2 MaxSim score for each text, in input order.
+
+        Also used by CRAG knowledge refinement to score sentence-level strips
+        with the same evaluator that scored the documents (Yan et al. 2024,
+        CRAG §4.4), instead of lexical overlap.
+        """
+        if not texts:
+            return []
+        # A throwaway dict when caching is off keeps one code path.
+        cache = self._cache if self._cache is not None else {}
+        todo = [t for t in dict.fromkeys(texts) if (query, t) not in cache]
+        if todo:
+            # ragatouille .rerank() returns [{'content', 'score', 'rank'}]
+            reranked = self.model.rerank(query=query, documents=todo, k=len(todo))
+            cache.update({(query, r['content']): float(r['score']) for r in reranked})
+        return [cache.get((query, t), float('-inf')) for t in texts]
 
     def rerank(self, query: str, documents: list, top_k: int = 10) -> list:
         """
@@ -73,7 +99,8 @@ class ColBERTv2Reranker:
           query: The user question.
           documents: List of dicts. Must contain a 'text' key.
                      (These come from the Hybrid Retriever)
-          top_k: Number of results to return after re-ranking.
+          top_k: Number of results to return after re-ranking. None returns
+                 every candidate (used when the ranking is fused afterwards).
 
         returns:
           List of top_k documents sorted by ColBERT MaxSim score (descending).
@@ -81,27 +108,11 @@ class ColBERTv2Reranker:
         if not documents:
             return []
 
-        # 1. Extract text for ColBERT scoring
-        texts = [doc['text'] for doc in documents]
+        # Score ALL candidates (not just top_k) so downstream CRAG analysis and
+        # rank fusion see the full score distribution.
+        scores = self.score(query, [doc['text'] for doc in documents])
+        for doc, score in zip(documents, scores):
+            doc['rerank_score'] = score
 
-        # 2. Score ALL documents via ColBERT v2 MaxSim
-        # ragatouille .rerank() returns: [{'content': str, 'score': float, 'rank': int}]
-        # We score all candidates (not just top_k) so downstream CRAG analysis
-        # can see the full score distribution for multi-signal confidence.
-        reranked = self.model.rerank(
-            query=query,
-            documents=texts,
-            k=len(texts)
-        )
-
-        # 3. Build content → score lookup
-        score_map = {r['content']: r['score'] for r in reranked}
-
-        # 4. Attach MaxSim scores to original document dicts
-        for doc in documents:
-            doc['rerank_score'] = float(score_map.get(doc['text'], float('-inf')))
-
-        # 5. Sort by MaxSim score descending
         sorted_docs = sorted(documents, key=lambda x: x['rerank_score'], reverse=True)
-
-        return sorted_docs[:top_k]
+        return sorted_docs if top_k is None else sorted_docs[:top_k]

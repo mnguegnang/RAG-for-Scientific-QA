@@ -4,69 +4,75 @@
 
 generation:
 
-  # Step 0 "Paper Focus" instruction (Fix 7).
-  # Addresses "Lost in the Middle" degradation (Liu et al. 2023, arXiv:2307.03172):
-  # LLMs systematically ignore evidence placed in the middle of long contexts;
-  # explicitly instructing the model to anchor on the most relevant document
-  # mitigates this by priming attention toward the highest-scoring passage.
-  paper_focus_instruction: >-
-    0. Paper Focus: First, identify which single document is most directly
-    relevant to the question. Anchor your answer primarily to that document.
-    Mention other documents only if they add genuinely complementary information.
-
   # Full RAG answer-generation prompt template.
   # Placeholders (filled by LocalLLMGenerator._build_prompt):
-  #   {context_str}             — numbered [Doc N] blocks from retrieved chunks
-  #   {paper_focus_instruction} — the Step 0 paper-focus instruction above
-  #   {query}                   — the user's question
+  #   {context_str} — "[Doc N] <chunk text>" blocks, in the order the chunks
+  #                   appear in the paper (order-preserving RAG)
+  #   {query}       — the user's question
+  #
+  # 2026-10-03 revision (key_metrics_improvements.md, P6):
+  #   - Removed the "Paper Focus: anchor to a single document" step. It was a
+  #     patch for cross-paper contamination that paper-scoped retrieval made
+  #     obsolete, and it steered the model away from multi-paragraph evidence,
+  #     which 55.5% of QASPER text-evidence answers need (Dasigi et al. 2021 §3).
+  #   - Context blocks no longer carry "Source: <paper_id>" (identical on every
+  #     block after scoping) or "[relevance: <MaxSim>]" (invites anchoring on rank).
+  #   - Answers target QASPER's length (references average 14.4 / 15.6 words,
+  #     Dasigi et al. 2021 §3; ours had a median of 44): the specific fact first,
+  #     every sentence cited. ALCE citation recall counts uncited sentences
+  #     against the answer (Gao et al. 2023 §3.3).
+  #   - Cite only the excerpts that state the fact: with 20 excerpts in view the
+  #     model otherwise cites every related one (4-5 tags on one sentence in the
+  #     smoke test), and ALCE citation precision only credits a citation that is
+  #     sufficient on its own or necessary (Gao et al. 2023 §3.3).
+  #   - The refusal rule now applies only when nothing in the excerpts bears on
+  #     the question; 8 of 22 previous refusals had the gold paragraph in context.
   #
   # One-shot example: SYNTHETIC, and deliberately not drawn from QASPER.
-  #
-  # It previously used QASPER paper 1909.00694 / "What is the seed lexicon?",
-  # which is an item in the evaluation set — the model reproduced the exemplar
-  # answer near-verbatim on that row and was scored on it. A demonstration
-  # that appears in the test set is contamination, and it inflates whichever
-  # rows it covers.
-  #
-  # A synthetic exemplar is immune to this no matter how the evaluation set is
-  # later drawn, and it costs nothing: per Min et al. 2022 below, demonstrations
-  # teach output format rather than task semantics, which is all this one is for.
-  # If you replace it, do not source the replacement from any split that the
-  # evaluation samples from.
+  # A demonstration that appears in the test set is contamination (an earlier
+  # version used QASPER paper 1909.00694, an evaluation item). If you replace it,
+  # do not source the replacement from any split that the evaluation samples from.
   # Rationale:
   #   - Gao et al. 2023 (ALCE, arXiv:2305.14627): ALCE uses regex \[Doc \d+\]
   #     to extract citations; format deviations yield a score of 0.
-  #   - Wei et al. 2022 (Chain-of-Thought, arXiv:2201.11903): few-shot
-  #     exemplars improve format adherence by 15-30%.
   #   - Min et al. 2022 (arXiv:2202.12837): demonstrations primarily teach
   #     output format rather than task semantics.
   rag_prompt_template: |
-    You are a precise scientific AI research assistant. Answer the user's query based ONLY on the provided context.
+    You are a precise scientific research assistant. Answer the question using ONLY the excerpts below. All excerpts come from the same research paper and are listed in the order they appear in the paper; tables are given as Markdown.
 
     <Context>
     {context_str}
     </Context>
 
     <Instructions>
-    {paper_focus_instruction}
-    1. Comprehension: Read the context carefully. If the context does not contain the answer, reply exactly with: "The retrieved documents do not contain enough information to answer this." Do not guess.
-    2. Chain of Thought: Provide a brief <Reasoning> section where you outline your logic based on the documents.
-    3. Citations: Provide a <Final Answer> section. Every factual claim MUST end with EXACTLY the tag [Doc N] where N is the document number (e.g. [Doc 1], [Doc 2]). Do NOT use any other format such as (Doc 1), [Document 1], or [1].
+    1. Find every excerpt that bears on the question. The evidence is often spread over several excerpts (for example a method paragraph and a results table); combine them when needed.
+    2. Write a brief <Reasoning> section naming the excerpts you used.
+    3. Write a <Final Answer> of one or two sentences (about 10 to 30 words) that states the specific fact asked for first. Copy names, numbers and units exactly as they appear in the excerpts. Do not add background or restate the question.
+    4. End every sentence of the Final Answer with its citation in EXACTLY the format [Doc N], for example [Doc 2] or [Doc 2][Doc 5]. Cite only the excerpts that directly state the fact in that sentence, usually one and at most two; do not cite excerpts that are merely on the same topic. Do NOT use any other format such as (Doc 1), [Document 1], or [1].
+    5. Only if no excerpt mentions what the question asks about, reply exactly with: "The retrieved documents do not contain enough information to answer this." If the excerpts answer the question partially, give the part they support instead of refusing.
     </Instructions>
 
     <Example>
     Context:
-    [Doc 1] Title: A Gated Alignment Network for Cross-Lingual Entity Linking. Section: Model. The alignment gate is a scalar produced by a feed-forward layer over the concatenated mention and candidate encodings.
-    [Doc 2] Title: A Gated Alignment Network for Cross-Lingual Entity Linking. Section: Model. We initialise the gate bias to -1.0 so that the network starts close to the monolingual baseline and learns to open the gate only where cross-lingual evidence helps.
-    [Doc 3] Title: A Gated Alignment Network for Cross-Lingual Entity Linking. Section: Experiments. Training used a batch size of 64 for 12 epochs on two V100 GPUs.
+    [Doc 1] Title: A Gated Alignment Network for Cross-Lingual Entity Linking. Section: Model.
+    The alignment gate is a scalar produced by a feed-forward layer over the concatenated mention and candidate encodings.
+    [Doc 2] Title: A Gated Alignment Network for Cross-Lingual Entity Linking. Section: Experiments.
+    We compare against the monolingual baseline and a hard-alignment variant on the TAC-KBP 2015 test set.
+    [Doc 3] Title: A Gated Alignment Network for Cross-Lingual Entity Linking. Section: Table 2.
+    Table 2: Linking accuracy on TAC-KBP 2015.
+    | Model | Accuracy |
+    |---|---|
+    | Monolingual baseline | 79.4 |
+    | Hard alignment | 81.0 |
+    | Gated alignment (ours) | 83.7 |
 
-    Question: How is the alignment gate initialised?
+    Question: How much does the gated model improve over the monolingual baseline?
 
     <Reasoning>
-    Doc 2 states the initialisation directly: the gate bias is set to -1.0, with the stated intent of starting near the monolingual baseline. Doc 1 describes what the gate is but not how it is initialised. Doc 3 covers training configuration and is not relevant to this question.
+    Doc 2 names the baseline and the test set; Doc 3 gives the accuracies: 83.7 for the gated model and 79.4 for the monolingual baseline, a gain of 4.3 points. Doc 1 describes the gate itself and is not needed.
     </Reasoning>
     <Final Answer>
-    The alignment gate's bias is initialised to -1.0 [Doc 2]. This starts the network close to the monolingual baseline, so the gate opens only where cross-lingual evidence is helpful [Doc 2].
+    The gated model reaches 83.7 accuracy versus 79.4 for the monolingual baseline on TAC-KBP 2015, a gain of 4.3 points [Doc 2][Doc 3].
     </Final Answer>
     </Example>
 
@@ -75,8 +81,8 @@ generation:
 
     <Output Format>
     <Reasoning>
-    (your step-by-step thinking)
+    (which excerpts answer the question)
     </Reasoning>
     <Final Answer>
-    (your synthesized, cited answer)
+    (one or two cited sentences)
     </Final Answer>

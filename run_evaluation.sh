@@ -42,6 +42,18 @@
 #   VLLM_ENFORCE_EAGER=1   skip CUDA-graph capture — much faster cold start,
 #                          slower generation. Useful for a smoke test.
 #   SKIP_PREFETCH=1        do not pre-download weights before starting a server
+#   PIPELINE_ARGS          extra flags for generate_predictions (context selection),
+#                          e.g. "--context-k 30 --crag-mode refine --final-ranking rrf"
+#   GROUNDING_CHECKER      hybrid (default: Prometheus for context recall, MiniCheck
+#                          for faithfulness + ALCE) | minicheck | prometheus
+#   GEN_MAX_MODEL_LEN      Llama context window (default 12288; the pipeline caps
+#                          the context block at --max-context-tokens, default 6000)
+#   EVAL_MAX_MODEL_LEN     Prometheus context window (default 8192)
+#   SKIP_GENERATION=1      reuse data/evaluation_dataset.csv: skip the Llama server and
+#                          prediction generation, go straight to evaluation
+#   EVAL_ARGS              extra flags for evaluate_rag, e.g. "--skip-alce" to resume after
+#                          a crash once the ALCE columns are saved in evaluation_report.csv
+#   MINICHECK_DTYPE        bfloat16 (default) | float32 — MiniCheck precision
 # ============================================================
 #SBATCH --job-name=rag_eval
 #SBATCH --output=logs/eval_%j.log
@@ -132,6 +144,10 @@ if [ -z "${HF_TOKEN:-}" ]; then
     echo "       export HF_TOKEN=hf_XXXX before running this script."
     exit 1
 fi
+# vLLM and huggingface_hub read the token from the environment. It is not
+# passed as --hf-token, because vLLM echoes its arguments (token included)
+# into logs/vllm_*.log.
+export HF_TOKEN
 export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 
 LLAMA_MODEL="meta-llama/Llama-3.1-8B-Instruct"
@@ -523,6 +539,12 @@ fi
 # During evaluation the judge talks to vLLM over HTTP and needs almost nothing.
 RAG_RESERVE_MIB=5120
 EVAL_RESERVE_MIB=2048
+GROUNDING_CHECKER="${GROUNDING_CHECKER:-hybrid}"
+# MiniCheck-Flan-T5 runs inside evaluate_rag.py next to the Prometheus server.
+# Measured peak (bfloat16, expandable_segments): 3.2 GiB reserved + ~0.5 GiB
+# CUDA context; vLLM also overshoots its utilisation target by ~0.7 GiB. The
+# 2026-10-04 run OOMed with float32 MiniCheck and a 6 GiB reserve.
+[ "${GROUNDING_CHECKER}" != "prometheus" ] && EVAL_RESERVE_MIB=7168
 LLAMA_WEIGHTS_MIB=16000       # 8.03 B params in bf16
 
 # util = (total - reserve) / total, clamped — a fixed fraction is wrong because
@@ -632,7 +654,15 @@ fi
 # PHASE 1 — Start Llama vLLM server (generation, vLLM only)
 # ============================================================
 LLAMA_PORT=8000
-if [ "${USE_GPU}" = true ] && [ "${HAVE_VLLM}" = true ]; then
+SKIP_GENERATION="${SKIP_GENERATION:-0}"
+if [ "${SKIP_GENERATION}" = "1" ]; then
+    if [ ! -s data/evaluation_dataset.csv ]; then
+        echo "ERROR: SKIP_GENERATION=1 but data/evaluation_dataset.csv does not exist."
+        exit 1
+    fi
+    echo "SKIP_GENERATION=1 — reusing data/evaluation_dataset.csv ($(date -r data/evaluation_dataset.csv '+%F %T'))."
+fi
+if [ "${USE_GPU}" = true ] && [ "${HAVE_VLLM}" = true ] && [ "${SKIP_GENERATION}" != "1" ]; then
     check_hf_access "${LLAMA_MODEL}"
     prefetch_model "${LLAMA_MODEL}"
 
@@ -649,9 +679,8 @@ if [ "${USE_GPU}" = true ] && [ "${HAVE_VLLM}" = true ]; then
         --port "${LLAMA_PORT}" \
         --tensor-parallel-size "${TP_SIZE}" \
         --gpu-memory-utilization "${GEN_MEM_UTIL}" \
-        --max-model-len 8192 \
+        --max-model-len "${GEN_MAX_MODEL_LEN:-12288}" \
         --disable-custom-all-reduce \
-        --hf-token "${HF_TOKEN}" \
         "${EAGER_FLAG[@]}")
     echo "  server pid ${VLLM_PID}"
 
@@ -663,11 +692,14 @@ export VLLM_API_URL="http://localhost:${LLAMA_PORT}/v1"
 # ============================================================
 # PHASE 2 — Generate RAG predictions
 # ============================================================
-echo "Generating RAG predictions (backend=${GENERATOR_BACKEND_VALUE}, endpoint=${VLLM_API_URL})..."
-CUDA_VISIBLE_DEVICES="${RAG_GPU}" \
-GENERATOR_BACKEND="${GENERATOR_BACKEND_VALUE}" \
-VLLM_API_URL="${VLLM_API_URL}" \
-"${RAG_PY}" -m src.evaluation.generate_predictions
+if [ "${SKIP_GENERATION}" != "1" ]; then
+    read -ra _PIPELINE_ARGS <<< "${PIPELINE_ARGS:-}"
+    echo "Generating RAG predictions (backend=${GENERATOR_BACKEND_VALUE}, endpoint=${VLLM_API_URL}, args=${PIPELINE_ARGS:-<defaults>})..."
+    CUDA_VISIBLE_DEVICES="${RAG_GPU}" \
+    GENERATOR_BACKEND="${GENERATOR_BACKEND_VALUE}" \
+    VLLM_API_URL="${VLLM_API_URL}" \
+    "${RAG_PY}" -m src.evaluation.generate_predictions "${_PIPELINE_ARGS[@]}"
+fi
 
 # ============================================================
 # PHASE 3 — Stop Llama, start Prometheus 2 vLLM (evaluation, vLLM only)
@@ -697,8 +729,7 @@ if [ "${USE_GPU}" = true ] && [ "${HAVE_VLLM}" = true ]; then
         --port "${PROMETHEUS_PORT}" \
         --tensor-parallel-size "${TP_SIZE}" \
         --gpu-memory-utilization "${EVAL_MEM_UTIL}" \
-        --max-model-len 4096 \
-        --hf-token "${HF_TOKEN}" \
+        --max-model-len "${EVAL_MAX_MODEL_LEN:-8192}" \
         "${EAGER_FLAG[@]}")
     echo "  server pid ${PROMETHEUS_PID}"
 
@@ -709,10 +740,11 @@ fi
 # ============================================================
 # PHASE 4 — Run Prometheus 2 + ALCE evaluation
 # ============================================================
-echo "Running Prometheus 2 + ALCE evaluation (judge on port ${PROMETHEUS_PORT})..."
+read -ra _EVAL_ARGS <<< "${EVAL_ARGS:-}"
+echo "Running Prometheus 2 + ALCE evaluation (judge on port ${PROMETHEUS_PORT}, grounding=${GROUNDING_CHECKER}, args=${EVAL_ARGS:-<none>})..."
 CUDA_VISIBLE_DEVICES="${RAG_GPU}" \
 PROMETHEUS_PORT="${PROMETHEUS_PORT}" \
-"${RAG_PY}" -m src.evaluation.evaluate_rag
+"${RAG_PY}" -m src.evaluation.evaluate_rag --grounding-checker "${GROUNDING_CHECKER}" "${_EVAL_ARGS[@]}"
 
 # ============================================================
 # CLEANUP — handled by the EXIT trap (stops both servers and

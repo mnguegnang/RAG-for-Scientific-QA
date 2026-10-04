@@ -9,7 +9,7 @@ from datasets import load_dataset
 from typing import List, Dict
 
 # Importing the orchestrator that runs the full RAG pipeline (Retriever + Reranker + Generator)
-from src.run_rag import ScientificRAGPipeline 
+from src.run_rag import ScientificRAGPipeline, add_pipeline_args, pipeline_kwargs
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -69,7 +69,8 @@ def extract_final_answer(full_response: str) -> str:
     return full_response
 
 
-def fetch_qasper_sample(num_samples: int = 10, seed: int = 20260902) -> List[Dict]:
+def fetch_qasper_sample(num_samples: int = 10, seed: int = 20260902,
+                        exclude_questions: set = None) -> List[Dict]:
     """
     Draw a random, seeded sample of QASPER questions that have a free-form answer.
 
@@ -84,6 +85,11 @@ def fetch_qasper_sample(num_samples: int = 10, seed: int = 20260902) -> List[Dic
     of them from one — so per-paper retrieval quality dominated the aggregate
     and the result was not a sample of the benchmark. Change `seed` to draw a
     different evaluation set; keep it fixed to compare runs.
+
+    Each item also carries the annotator's gold `evidence` list (used by the
+    offline retrieval harness, evaluate_retrieval.py). *exclude_questions*
+    removes (paper_id, question) pairs from the pool, so a tuning sample can
+    be drawn disjoint from the evaluation sample.
     """
     logging.info("Loading QASPER (train split) and sampling %d questions (seed=%d)...",
                  num_samples, seed)
@@ -105,8 +111,13 @@ def fetch_qasper_sample(num_samples: int = 10, seed: int = 20260902) -> List[Dic
                         "question":     q,
                         "ground_truth": ans['free_form_answer'],
                         "paper_id":     row["id"],  # QASPER paper ID — used to scope retrieval
+                        "evidence":     ans['evidence'],
                     })
                     break # Stop if we found a valid answer for this question
+
+    if exclude_questions:
+        qa_pairs = [qa for qa in qa_pairs
+                    if (qa["paper_id"], qa["question"]) not in exclude_questions]
 
     if num_samples >= len(qa_pairs):
         logging.warning("Requested %d questions but only %d are available; using all.",
@@ -118,7 +129,15 @@ def fetch_qasper_sample(num_samples: int = 10, seed: int = 20260902) -> List[Dic
                  len(sample), len({p["paper_id"] for p in sample}), len(qa_pairs))
     return sample
 
-def generate_evaluation_dataset(output_path: str = None):
+def _index_paths(indices_dir: str = None) -> dict:
+    d = Path(indices_dir) if indices_dir else Path("data/indices")
+    return dict(dense_index_path=str(d / "dense.index"),
+                dense_meta_path=str(d / "dense.index.meta"),
+                sparse_index_path=str(d / "sparse.pkl"))
+
+
+def generate_evaluation_dataset(output_path: str = None, pipeline_config: dict = None,
+                                num_samples: int = 150, indices_dir: str = None):
     """
     Passes QASPER questions through the RAG Pipeline and formats 
     the output exactly as RAGAS expects.
@@ -140,14 +159,15 @@ def generate_evaluation_dataset(output_path: str = None):
         generator_backend,
     )
     rag_pipeline = ScientificRAGPipeline(
-        dense_index_path="data/indices/dense.index",
-        dense_meta_path="data/indices/dense.index.meta",
-        sparse_index_path="data/indices/sparse.pkl",
+        **_index_paths(indices_dir),
         generator_backend=generator_backend,
+        **(pipeline_config or {}),
     )
-    
-    # 2. Get the evaluation questions use 150 for sample testing
-    qa_pairs = fetch_qasper_sample(150)#num_samples=150
+    config_json = json.dumps(rag_pipeline.config(), sort_keys=True)
+    logging.info("Pipeline config: %s", config_json)
+
+    # 2. Get the evaluation questions (150 by default)
+    qa_pairs = fetch_qasper_sample(num_samples)
     
     results = []
     logging.info(f"Generating RAG answers for {len(qa_pairs)} questions...")
@@ -204,6 +224,13 @@ def generate_evaluation_dataset(output_path: str = None):
             "best_rerank_score":  best_score,           # Used by calibrate_crag.py
             "crag_triggered":     pipeline_output.get("crag_triggered", False),
             "extraction_fallback": extraction_fallback, # True when <Final Answer> tag was absent
+            # Rank of each context in the final ranking, aligned with `contexts`
+            # (which is in the order the generator saw: paper order by default).
+            # evaluate_rag.py takes context precision's "top-3" from these.
+            "context_ranks":      [doc.get("rerank_rank") for doc in retrieved_docs],
+            "context_types":      [doc.get("chunk_type", "text") for doc in retrieved_docs],
+            "crag_action":        pipeline_output.get("crag_action"),
+            "pipeline_config":    config_json,
         })
         
     # 3. Save to disk
@@ -216,7 +243,8 @@ def generate_evaluation_dataset(output_path: str = None):
     rag_pipeline.generator.log_generation_summary()
 
 
-def regenerate_error_rows(csv_path: str = None):
+def regenerate_error_rows(csv_path: str = None, pipeline_config: dict = None,
+                          indices_dir: str = None):
     """Re-process only rows whose 'answer' contains a System Error string.
 
     This avoids re-running the full 150-question pipeline when Ollama was
@@ -260,11 +288,16 @@ def regenerate_error_rows(csv_path: str = None):
     # Initialize pipeline (Ollama health check will run at init)
     generator_backend = os.environ.get("GENERATOR_BACKEND", "auto")
     rag_pipeline = ScientificRAGPipeline(
-        dense_index_path="data/indices/dense.index",
-        dense_meta_path="data/indices/dense.index.meta",
-        sparse_index_path="data/indices/sparse.pkl",
+        **_index_paths(indices_dir),
         generator_backend=generator_backend,
+        **(pipeline_config or {}),
     )
+    if "pipeline_config" in df.columns:
+        stored = df["pipeline_config"].dropna().unique()
+        current = json.dumps(rag_pipeline.config(), sort_keys=True)
+        if len(stored) and stored[0] != current:
+            logging.warning("Re-generating with config %s, but the CSV was produced with %s. "
+                            "Pass the same flags as the original run.", current, stored[0])
 
     fixed = 0
     for error_num, idx in enumerate(df.index[error_mask], 1):
@@ -313,6 +346,12 @@ def regenerate_error_rows(csv_path: str = None):
         df.at[idx, 'best_rerank_score'] = best_score
         df.at[idx, 'crag_triggered'] = pipeline_output.get("crag_triggered", False)
         df.at[idx, 'extraction_fallback'] = extraction_fallback
+        if 'context_ranks' in df.columns:
+            df.at[idx, 'context_ranks'] = str([d.get("rerank_rank") for d in retrieved_docs])
+        if 'context_types' in df.columns:
+            df.at[idx, 'context_types'] = str([d.get("chunk_type", "text") for d in retrieved_docs])
+        if 'crag_action' in df.columns:
+            df.at[idx, 'crag_action'] = pipeline_output.get("crag_action")
         fixed += 1
 
     df.to_csv(csv_path, index=False)
@@ -340,9 +379,16 @@ if __name__ == "__main__":
         "--csv", type=str, default=None,
         help="Path to evaluation_dataset.csv (default: data/evaluation_dataset.csv).",
     )
+    parser.add_argument("--num-samples", type=int, default=150,
+                        help="Number of QASPER questions (default: 150).")
+    parser.add_argument("--indices-dir", type=str, default=None,
+                        help="Index directory (default: data/indices), e.g. data/indices_text_only.")
+    add_pipeline_args(parser)
     args = parser.parse_args()
 
     if args.fix_errors:
-        regenerate_error_rows(csv_path=args.csv)
+        regenerate_error_rows(csv_path=args.csv, pipeline_config=pipeline_kwargs(args),
+                              indices_dir=args.indices_dir)
     else:
-        generate_evaluation_dataset(output_path=args.csv)
+        generate_evaluation_dataset(output_path=args.csv, pipeline_config=pipeline_kwargs(args),
+                                    num_samples=args.num_samples, indices_dir=args.indices_dir)

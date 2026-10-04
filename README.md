@@ -23,42 +23,43 @@ The pipeline is built on the [QASPER](https://huggingface.co/datasets/allenai/qa
 ## Architecture
 
 ```
-User Query
+User Query (+ paper_id)
     │
-    ├─ [< 10 words] ──► HyDE: LLM generates a hypothetical passage
-    │                         used as the dense query instead of the raw question
+    ├─ [< 10 words, and only when it can change the result] ──► HyDE passage for the dense leg
     ▼
-┌───────────────────────────────────────────────┐
-│  Stage 1 — Hybrid Retrieval  (top-100)        │
-│  SPECTER2 dense search   (FAISS flat index)   │
-│  BM25 sparse search      (NLTK-tokenized)     │
-│       └── Reciprocal Rank Fusion (k=60)       │
-│       └── [optional] paper_id filter          │
-└───────────────────────────────────────────────┘
-    │
-    ▼
-┌───────────────────────────────────────┐
-│  Stage 2 — ColBERT v2 Late Interaction │
-│  colbert-ir/colbertv2.0 → top-10       │
-│  MaxSim scoring (via RAGatouille)      │
-└───────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  Stage 1 — Hybrid Retrieval (≤ 100, paper-scoped) │
+│  SPECTER2 dense search   (FAISS flat index)       │
+│  BM25 sparse search      (NLTK-tokenized)         │
+│       └── Reciprocal Rank Fusion (k=60)           │
+│  Index: abstract + paragraphs + table/figure      │
+│         captions + table bodies (arXiv LaTeX)     │
+└──────────────────────────────────────────────────┘
     │
     ▼
-┌─────────────────────────────────────────────────┐
-│  Stage 3 — CRAG Relevance Gate (Yan et al. 2024) │
-│  Per-doc classify: {Correct, Ambiguous, Incorrect}│
-│  + self-consistency ratio across the top-10       │
-│  Ambiguous → sentence-level knowledge refinement  │
-│  Incorrect → fall back to top-5 by rerank score   │
-│              (no hard refusal)                    │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  Stage 2 — Ranking                                │
+│  ColBERT v2 MaxSim over every candidate           │
+│  [--final-ranking rrf] fuse with BM25/SPECTER2    │
+│  keep top context_k (default 20)                  │
+└──────────────────────────────────────────────────┘
     │
     ▼
-┌──────────────────────────────────────────────────────┐
-│  Stage 4 — Generation                                │
-│  Llama-3.1-8B-Instruct (vLLM / HuggingFace / Ollama) │
-│  Chain-of-Thought + [Doc N] citation prompt          │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  Stage 3 — CRAG (Yan et al. 2024)                 │
+│  Per-doc label: {Correct, Ambiguous, Incorrect}   │
+│  signal (default): label + report, never delete   │
+│  refine: ColBERT-scored strip refinement          │
+│  legacy: pre-2026-10 filtering (ablations)        │
+└──────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────┐
+│  Stage 4 — Generation                             │
+│  token budget → chunks in paper order (OP-RAG)    │
+│  Llama-3.1-8B-Instruct (vLLM / HF / Ollama)       │
+│  short answers, every sentence cited [Doc N]      │
+└──────────────────────────────────────────────────┘
     │
     ▼
  Cited Answer
@@ -67,13 +68,14 @@ User Query
 | Component | Model / Library |
 |-----------|----------------|
 | **Document ingestion** | HuggingFace `datasets` — `allenai/qasper` |
-| **Chunking** | Custom `QasperChunker` — 500-token chunks, 10% overlap, contextual prefix |
+| **Chunking** | Custom `QasperChunker` — abstract, 500-token paragraph chunks (10% overlap), table/figure captions, Markdown table bodies; contextual prefix |
 | **Dense embedding** | `allenai/specter2_base` + retrieval adapter (768-dim) |
 | **Vector store** | FAISS flat index (`IndexFlatIP`) |
 | **Sparse index** | BM25 (`rank-bm25`) with NLTK tokenization, stop-word removal, Porter stemming |
 | **Retrieval fusion** | Reciprocal Rank Fusion (Cormack et al. 2009, `rrf_k=60`) |
-| **Reranker** | ColBERT v2 late interaction (`colbert-ir/colbertv2.0`, Santhanam et al. 2022) via RAGatouille |
-| **Relevance gate** | Corrective RAG (Yan et al. 2024) — three-way classification + knowledge refinement |
+| **Reranker** | ColBERT v2 late interaction (`colbert-ir/colbertv2.0`, Santhanam et al. 2022) via RAGatouille; optional RRF with the stage-1 ranks |
+| **Relevance gate** | Corrective RAG (Yan et al. 2024) — three-way classification; non-destructive by default |
+| **Context order** | Order-preserving RAG (Yu et al. 2024, arXiv:2409.01666) |
 | **LLM** | `meta-llama/Llama-3.1-8B-Instruct` via vLLM, HuggingFace Transformers, or Ollama |
 | **Orchestration** | Custom Python (`src/run_rag.py::ScientificRAGPipeline`) |
 
@@ -137,7 +139,11 @@ falls back to `.venv` when `.venv-vllm` is absent.
 ### What data is used
 
 The system indexes the training split of QASPER (`allenai/qasper`), which contains full texts of
-NLP research papers. Each paper is split into overlapping 500-token chunks, each prefixed with:
+NLP research papers. Each paper yields, in reading order: its abstract, its paragraphs (split into
+overlapping 500-token chunks when longer), and one chunk per table/figure caption. When
+`data/table_bodies.json` exists, table chunks also carry the table body as Markdown, extracted from
+the paper's arXiv LaTeX source (40% of the evaluation questions need table/figure evidence). Every
+chunk is prefixed with:
 
 ```
 Title: <paper title>. Section: <section heading>.
@@ -150,8 +156,11 @@ scoring.
 ### Building the index (required before first use)
 
 ```bash
+# Optional (~45 min, rate-limited to 1 request / 3 s): table bodies from arXiv LaTeX
+python -m src.data.arxiv_tables            # -> data/table_bodies.json, cache in data/arxiv_src/
+
 # Local GPU
-python -m src.pipeline_ingest
+python -m src.pipeline_ingest              # uses data/table_bodies.json when present
 
 # SLURM cluster
 sbatch src/run_pipeline_ingest.sh
@@ -162,7 +171,7 @@ sbatch src/run_pipeline_ingest.sh
 | File | Description |
 |------|-------------|
 | `dense.index` | FAISS flat index (`IndexFlatIP`) |
-| `dense.index.meta` | Pickled chunk metadata — text, paper_id, section |
+| `dense.index.meta` | Pickled chunk metadata — text, paper_id, section, chunk_id, chunk_type, position |
 | `sparse.pkl` | BM25 model + tokenized corpus, as `{'model': BM25Okapi, 'metadata': [...]}` |
 | `*.sha256` | Sidecar hash for each index, checked before deserialization |
 
@@ -184,6 +193,7 @@ The indices are append-free — there is no incremental update path.
 
 ```bash
 python -m src.run_rag --query "What encoder architecture does the paper use?"
+python -m src.run_rag --query "..." --paper-id 1909.00694    # restrict to one paper
 python -m src.run_rag --query "..." --backend ollama         # CPU / laptop
 python -m src.run_rag --query "..." --backend transformers --hf-model meta-llama/Llama-3.1-8B-Instruct
 ```
@@ -192,10 +202,16 @@ Optional flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--backend` | `auto` | `auto` (transformers on GPU, ollama on CPU), `ollama`, or `transformers`. Use the `GENERATOR_BACKEND=vllm` env var to route to a vLLM server instead. |
+| `--backend` | `auto` | `auto` (transformers on GPU, ollama on CPU), `ollama`, `transformers`, or `vllm` |
+| `--paper-id` | none | Restrict retrieval to one QASPER paper |
+| `--context-k` | `20` | Chunks passed to the generator |
+| `--context-order` | `paper` | `paper` (order-preserving) or `rank` (by relevance) |
+| `--final-ranking` | `colbert` | `colbert`, or `rrf` to fuse ColBERT with the BM25/SPECTER2 ranks |
+| `--max-context-tokens` | `6000` | Approximate context budget; lowest-ranked chunks dropped beyond it |
+| `--crag-mode` | `signal` | `signal` (label only), `refine` (ColBERT strip refinement), `legacy` |
 | `--crag-correct` | `14.44` | ColBERT MaxSim threshold for the CRAG `Correct` label |
 | `--crag-ambiguous` | `8.0` | ColBERT MaxSim threshold for the CRAG `Ambiguous` label |
-| `--crag-consistency` | `0.3` | Minimum fraction of top-10 docs labeled `Correct` for the gate to pass |
+| `--crag-consistency` | `0.0` (`0.3` in legacy mode) | Minimum fraction of docs labeled `Correct` for action `Correct` |
 | `--dense-index` | `data/indices/dense.index` | Path to the FAISS index |
 | `--dense-meta` | `data/indices/dense.index.meta` | Path to the chunk metadata pickle |
 | `--sparse-index` | `data/indices/sparse.pkl` | Path to the BM25 index |
@@ -265,6 +281,8 @@ python -m src.evaluation.generate_predictions --fix-errors
 | `GENERATOR_BACKEND` | No | Override LLM backend: `vllm`, `transformers`, or `ollama` |
 | `VLLM_API_URL` | No | Llama vLLM server endpoint (default: `http://localhost:8000/v1`) |
 | `PROMETHEUS_PORT` | No | Prometheus 2 vLLM port for evaluation (default: `8001`) |
+| `GROUNDING_CHECKER` | No | Support-check judge: `hybrid` (default), `minicheck`, `prometheus` |
+| `PIPELINE_ARGS` | No | Extra context-selection flags `run_evaluation.sh` passes to `generate_predictions` |
 | `HF_HOME` | No | Model weight cache — pinned to `/workspace` by `run_evaluation.sh` on RunPod |
 
 ### Key hyperparameters
@@ -275,11 +293,12 @@ python -m src.evaluation.generate_predictions --fix-errors
 | `overlap_pct` | `retrieval/chunking.py` | `0.1` | Overlap fraction (50 tokens) |
 | retrieval `k` | `run_rag.py` | `100` | Candidates fetched by hybrid retrieval before reranking |
 | `rrf_k` | `retrieval/hybrid_retriever.py` | `60` | RRF constant (Cormack et al. 2009) |
-| rerank `top_k` | `run_rag.py` | `10` | Documents kept after ColBERT reranking |
+| `context_k` | `run_rag.py` | `20` | Documents kept after ranking (`--context-k`) |
+| `max_context_tokens` | `run_rag.py` | `6000` | Context budget (`--max-context-tokens`) |
 | `HYDE_QUERY_WORD_THRESHOLD` | `run_rag.py` | `10` | Queries shorter than this (in words) trigger HyDE |
 | `crag_correct_threshold` | `run_rag.py` | `14.44` | ColBERT MaxSim floor for CRAG `Correct` |
 | `crag_ambiguous_threshold` | `run_rag.py` | `8.0` | ColBERT MaxSim floor for CRAG `Ambiguous` |
-| `crag_consistency_ratio` | `run_rag.py` | `0.3` | Min. fraction of `Correct`-labeled docs required |
+| `crag_consistency_ratio` | `run_rag.py` | `0.0` (`0.3` legacy) | Min. fraction of `Correct`-labeled docs required |
 | `gpu_memory_utilization` | `run_evaluation.sh` | auto-computed | vLLM GPU memory fraction (single-GPU mode) |
 
 ### `configs/default.yaml`
@@ -300,23 +319,36 @@ The generation system prompt, few-shot exemplar, and output-format instructions.
   LLM judge fine-tuned specifically for evaluation, scored with the ABSOLUTE_PROMPT rubric format
   (raw 1–5 score normalized to `[0, 1]`). Auto-selects a backend: vLLM server → HF `transformers`
   pipeline → Ollama (CPU fallback).
-  - *Context Precision* — fraction of retrieved chunks relevant to the question
-  - *Context Recall* — fraction of gold evidence covered by retrieved chunks
-  - *Faithfulness* — fraction of answer claims supported by retrieved context
+  - *Context Precision* — relevance of the 3 best-ranked retrieved chunks
   - *Answer Relevancy* — how completely the answer addresses the question
   - *Answer Correctness* — factual match against the QASPER reference answer
 
+- **Sentence-level support checks** (`src/evaluation/grounding.py`, `--grounding-checker`):
+  - *Context Recall* — fraction of ground-truth sentences supported by the retrieved chunks
+  - *Faithfulness* — fraction of answer sentences supported by the retrieved chunks
+  - The default `hybrid` checker uses Prometheus True/False prompts for context recall and
+    **MiniCheck-Flan-T5-Large** ([Tang et al. 2024](https://arxiv.org/abs/2404.10774)) for
+    faithfulness and ALCE — the per-metric split that agreed best with independent labels
+    (`compare_grounding_checkers.py`). Both metrics see every chunk the generator saw.
+
 - **[ALCE](https://github.com/princeton-nlp/ALCE)** (Gao et al. 2023, EMNLP) — citation-level
-  grounding via NLI entailment:
-  - *Citation Precision* — fraction of cited sentences entailed by the cited document
-  - *Citation Recall* — fraction of answer sentences that have a supporting citation
+  grounding via NLI entailment (decided by the support checker above):
+  - *Citation Precision* — fraction of citations that are correct (sufficient or necessary)
+  - *Citation Recall* — fraction of answer sentences entailed by their cited documents
+
+- **Retrieval harness** (`python -m src.evaluation.evaluate_retrieval`) — evidence recall against
+  QASPER's gold evidence (text paragraphs and tables/figures) for a grid of context-selection
+  configurations, with no LLM or judge calls. Use it to choose `--context-k`, `--final-ranking`
+  and `--crag-mode` before a full evaluation run.
 
 ### Running evaluation
 
 ```bash
+python -m src.evaluation.evaluate_retrieval     # no LLM: evidence recall per config → data/retrieval_eval.csv
 python -m src.evaluation.generate_predictions   # requires indices → data/evaluation_dataset.csv
 python -m src.evaluation.evaluate_rag           # requires vLLM/Ollama running → data/evaluation_report.csv
 bash run_evaluation.sh                          # both, end-to-end
+PIPELINE_ARGS="--context-k 30 --crag-mode refine" bash run_evaluation.sh   # an alternative config
 ```
 
 ### Current results
@@ -347,6 +379,9 @@ rather than the RAG system:
 | `validate_retrieval_scoping.py` | Regression check that retrieved contexts stay within the queried paper |
 | `validate_precision_cutoff.py` | Checks whether scoring context precision on top-3 vs. top-10 chunks diverges |
 | `compile_dspy_prompt.py` | Compiles the generation prompt's few-shot demonstrations with DSPy |
+| `compare_grounding_checkers.py` | Kappa of MiniCheck vs. Prometheus 2 against the labelled validation units |
+| `evaluate_retrieval.py` | Offline evidence recall vs. QASPER gold evidence (no LLM) |
+| `compare_reports.py` | Paired per-metric comparison of two evaluation reports, with bootstrap CIs |
 
 ---
 

@@ -20,6 +20,15 @@ try:
 except (FileNotFoundError, Exception):
     _GEN_CFG = {}
 
+def format_context_blocks(retrieved_docs: List[Dict[str, Any]]) -> List[str]:
+    """One "[Doc N] <text>" block per doc; shared by the static template and DSPy."""
+    return [f"[Doc {i}] {doc.get('text', '')}" for i, doc in enumerate(retrieved_docs, 1)]
+
+
+def format_context_str(retrieved_docs: List[Dict[str, Any]]) -> str:
+    return "\n\n".join(format_context_blocks(retrieved_docs))
+
+
 # Default HuggingFace model used when backend="transformers"
 # Llama-3.1-8B-Instruct fits in ~16GB VRAM (BF16); well within one A100-80GB.
 # Reference: Meta AI (2024) https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct
@@ -44,6 +53,10 @@ class LocalLLMGenerator:
         hf_model (str):     HuggingFace model ID, e.g. ``"meta-llama/Llama-3.1-8B-Instruct"``.
         api_url (str):      Ollama REST endpoint (only used when backend=="ollama").
     """
+
+    # vLLM backend: frequency penalty for the single retry after an output
+    # hits max_tokens (a repetition loop). See _generate_vllm.
+    LOOP_RETRY_FREQUENCY_PENALTY = 0.5
 
     def __init__(
         self,
@@ -222,52 +235,38 @@ class LocalLLMGenerator:
         """
         Constructs the Chain-of-Thought and Citation prompt.
 
-        HybridRetriever.search() returns dicts with keys: 'text', 'doc_id', 'score'.
-        We use 'doc_id' directly as the source label so citations like [Doc 1] can
-        be traced back to real paper IDs rather than 'Unknown Source'.
+        Each block is "[Doc N] <chunk text>"; the chunk text already starts with
+        its "Title: … Section: …" header. Blocks follow the order of
+        retrieved_docs (paper order by default), and [Doc N] maps to
+        retrieved_docs[N-1] — the same indexing ALCE uses on `contexts`.
+        No paper ID or reranker score is shown: after paper-scoped retrieval
+        the ID is identical on every block, and raw scores invite the model to
+        anchor on rank (key_metrics_improvements.md, 2026-10-03, P6).
         """
-        # 1. Format the context
-        context_str = ""
-        for i, doc in enumerate(retrieved_docs, 1):
-            # Use doc_id from HybridRetriever output; fall back gracefully if absent
-            doc_id = doc.get('doc_id', doc.get('id', f'doc_{i}'))
-            score  = doc.get('rerank_score', doc.get('score', None))
-            score_str = f"  [relevance: {score:.4f}]" if score is not None else ""
+        context_str = format_context_str(retrieved_docs)
 
-            context_str += f"[Doc {i}]\nSource: {doc_id}{score_str}\nContent: {doc.get('text', '')}\n\n"
-
-        # 2. Build prompt from configs/prompts.yaml template
-        # Falls back to the hardcoded default if the YAML is unavailable.
-        paper_focus = _GEN_CFG.get(
-            "paper_focus_instruction",
-            "0. Paper Focus: First, identify which single document is most directly "
-            "relevant to the question. Anchor your answer primarily to that document. "
-            "Mention other documents only if they add genuinely complementary information.",
-        )
+        # Build prompt from configs/prompts.yaml; inline fallback if unavailable.
         template = _GEN_CFG.get("rag_prompt_template", None)
         if template:
-            prompt = template.format(
-                context_str=context_str,
-                paper_focus_instruction=paper_focus,
-                query=query,
-            )
-        else:
-            # Inline fallback (identical to the YAML template above)
-            prompt = (
-                f"You are a precise scientific AI research assistant. "
-                f"Answer the user's query based ONLY on the provided context.\n\n"
-                f"<Context>\n{context_str}\n</Context>\n\n"
-                f"<Instructions>\n{paper_focus}\n"
-                f"1. Comprehension: Read the context carefully. If the context does not "
-                f"contain the answer, reply exactly with: \"The retrieved documents do not "
-                f"contain enough information to answer this.\" Do not guess.\n"
-                f"2. Chain of Thought: Provide a brief <Reasoning> section.\n"
-                f"3. Citations: Every factual claim MUST end with the source tag, e.g., [Doc 1].\n"
-                f"</Instructions>\n\n<User Query>\n{query}\n\n"
-                f"<Output Format>\n<Reasoning>\n(your step-by-step thinking)\n"
-                f"</Reasoning>\n<Final Answer>\n(your synthesized, cited answer)\n</Final Answer>\n"
-            )
-        return prompt
+            return template.format(context_str=context_str, query=query)
+        return (
+            "You are a precise scientific research assistant. Answer the question using "
+            "ONLY the excerpts below. All excerpts come from the same research paper and "
+            "are listed in the order they appear in the paper.\n\n"
+            f"<Context>\n{context_str}\n</Context>\n\n"
+            "<Instructions>\n"
+            "1. Find every excerpt that bears on the question and combine them when needed.\n"
+            "2. Write a brief <Reasoning> section naming the excerpts you used.\n"
+            "3. Write a <Final Answer> of one or two sentences that states the specific fact "
+            "first, copying names, numbers and units exactly.\n"
+            "4. End every sentence with its citation in EXACTLY the format [Doc N], citing "
+            "only the excerpts that directly state the fact (usually one, at most two).\n"
+            "5. Only if no excerpt mentions what the question asks about, reply exactly with: "
+            "\"The retrieved documents do not contain enough information to answer this.\"\n"
+            f"</Instructions>\n\n<User Query>\n{query}\n\n"
+            "<Output Format>\n<Reasoning>\n(which excerpts answer the question)\n"
+            "</Reasoning>\n<Final Answer>\n(one or two cited sentences)\n</Final Answer>\n"
+        )
 
     def generate_answer(self, query: str, retrieved_docs: List[Dict[str, Any]]) -> str:
         """
@@ -493,13 +492,30 @@ class LocalLLMGenerator:
             self.vllm_url, self.model_name,
         )
         client = OpenAI(base_url=self.vllm_url, api_key="EMPTY")
-        resp = client.chat.completions.create(
-            model=self.model_name,
-            messages=[{"role": "user", "content": full_prompt}],
-            max_tokens=1024,
-            temperature=0.1,
-        )
-        answer = resp.choices[0].message.content or ""
+
+        def _complete(**extra):
+            return client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": full_prompt}],
+                max_tokens=1024,
+                temperature=0.1,
+                **extra,
+            ).choices[0]
+
+        choice = _complete()
+        answer = choice.message.content or ""
+        if choice.finish_reason == "length":
+            # A short cited answer never needs 1024 tokens: hitting the cap
+            # means a repetition loop (seen when the answer is absent from the
+            # excerpts), and the truncated output has no <Final Answer>, so the
+            # whole loop would be scored as the answer. Retry once with a
+            # frequency penalty, which (unlike repetition_penalty) only counts
+            # generated tokens, so copying numbers from the context is not
+            # discouraged. Normal rows never reach this branch.
+            logging.warning("[vLLM] Output hit max_tokens (likely a repetition loop); "
+                            "retrying once with frequency_penalty=%.1f.", self.LOOP_RETRY_FREQUENCY_PENALTY)
+            retry = _complete(frequency_penalty=self.LOOP_RETRY_FREQUENCY_PENALTY)
+            answer = retry.message.content or answer
         print("\n" + "="*40 + " LLM OUTPUT (vLLM) " + "="*40 + "\n")
         print(answer)
         print("\n" + "="*92 + "\n")
@@ -527,8 +543,7 @@ class LocalLLMGenerator:
         return answer
 
     # ── HyDE: Hypothetical Document Embedding ──────────────────────────────────
-    def generate_hypothetical_answer(self, query: str,
-                                     filter_paper_id: str = None) -> str:
+    def generate_hypothetical_answer(self, query: str) -> str:
         """
         Generates a brief hypothetical passage for HyDE dense retrieval.
 
@@ -537,10 +552,9 @@ class LocalLLMGenerator:
         This passage is then encoded by SPECTER2 in place of the raw query,
         closing the query-document semantic gap.
 
-        When *filter_paper_id* is set, a scoping note is appended to the prompt
-        so the hypothetical passage is grounded in the vocabulary and framing of
-        the target paper, improving dense-retrieval precision on paper-specific
-        QASPER queries.
+        The prompt deliberately carries no paper ID: the model cannot map an
+        arXiv ID to the paper's content, so the note only added noise
+        (key_metrics_improvements.md, 2026-10-03, P5).
 
         Reference:
             Gao et al. (2022). Precise Zero-Shot Dense Retrieval without
@@ -556,11 +570,6 @@ class LocalLLMGenerator:
             f"Question: {query}\n\n"
             "Hypothetical passage:"
         )
-        if filter_paper_id:
-            hyde_prompt += (
-                f"\nNote: The answer should be from an NLP research paper "
-                f"with ID: {filter_paper_id}."
-            )
         if self.backend == "ollama":
             payload = {
                 "model": self.model_name,

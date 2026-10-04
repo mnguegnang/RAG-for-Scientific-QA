@@ -103,9 +103,21 @@ class HybridRetriever:
         self._sparse_rows_by_paper = defaultdict(list)
         for row, paper_id in enumerate(self.bm25_ids):
             self._sparse_rows_by_paper[paper_id].append(row)
-        #self.bm25_corpus = self.bm25_package['metadata'] # The actual chunks
-        #self.bm25_ids = self.bm25_package['doc_ids'] # The IDs
-            
+        self._sparse_meta = metadata_list
+
+    # Chunk metadata carried through to the reranker, CRAG and the generator.
+    # `position` / `chunk_id` drive order-preserving context (OP-RAG);
+    # `chunk_type` distinguishes text, abstract, table and figure chunks.
+    _META_KEYS = ("chunk_id", "section_name", "chunk_type", "position", "title")
+
+    @classmethod
+    def _chunk_fields(cls, meta: dict) -> dict:
+        return {key: meta[key] for key in cls._META_KEYS if key in meta}
+
+    def paper_chunk_count(self, paper_id: str) -> int:
+        """Number of indexed chunks for *paper_id* (0 if the paper is not indexed)."""
+        return len(self._dense_rows_by_paper.get(paper_id, []))
+
     def _search_dense(self, query: str, k: int, dense_query: str = None,
                       filter_paper_id: str = None):
         """Standard Vector Search.
@@ -140,10 +152,12 @@ class HybridRetriever:
         results = []
         for i, idx in enumerate(indices[0]):
             if idx != -1: # FAISS returns -1 if not enough neighbors
+                meta = self.dense_meta[idx]
                 results.append({
-                    "doc_id": self.dense_meta[idx]['paper_id'], # Assuming metadata structure
-                    "text": self.dense_meta[idx]['text'],
-                    "rank": i + 1  # 1-based rank
+                    "doc_id": meta['paper_id'],
+                    "text": meta['text'],
+                    "rank": i + 1,  # 1-based rank
+                    **self._chunk_fields(meta),
                 })
         return results
 
@@ -183,8 +197,9 @@ class HybridRetriever:
         for rank, idx in enumerate(best_indices):
             results.append({
                 "doc_id": self.bm25_ids[idx],
-                "text": self.bm25_corpus[idx], # Assuming corpus is list of text
-                "rank": rank + 1 # 1-based rank
+                "text": self.bm25_corpus[idx],
+                "rank": rank + 1,  # 1-based rank
+                **self._chunk_fields(self._sparse_meta[idx]),
             })
         return results
 
@@ -223,26 +238,35 @@ class HybridRetriever:
         score_map = defaultdict(float)
         content_map = {} # Keep track of content so we can return it
         
+        # Per-leg ranks are kept on the result so a later stage can re-fuse
+        # them with the reranker's ranking (run_rag.py, final_ranking="rrf").
+        dense_rank, sparse_rank = {}, {}
+
         # Process Dense
         for item in dense_res:
             score_map[item['text']] += 1 / (rrf_k + item['rank'])
             content_map[item['text']] = item
-            
+            dense_rank[item['text']] = item['rank']
+
         # Process Sparse
         for item in sparse_res:
             score_map[item['text']] += 1 / (rrf_k + item['rank'])
-            content_map[item['text']] = item # Overwrite is fine, content is same
-            
+            content_map.setdefault(item['text'], item)  # same chunk, same metadata
+            sparse_rank[item['text']] = item['rank']
+
         # 3. Sort and Format
         sorted_items = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
-        
+
         final_results = []
         for text, score in sorted_items[:k]: # Return top K from the fused list
             meta = content_map[text]
             final_results.append({
                 "text": text,
                 "doc_id": meta['doc_id'],
-                "score": score
+                "score": score,
+                "dense_rank": dense_rank.get(text),
+                "sparse_rank": sparse_rank.get(text),
+                **self._chunk_fields(meta),
             })
-            
+
         return final_results

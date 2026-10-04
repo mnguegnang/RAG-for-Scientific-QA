@@ -8,7 +8,7 @@ demonstrations against a citation-format/anti-stuffing metric instead of
 hand-tuning the prompt text.
 
 This is a *direct port*, not a redesign: the citation-tag rules and
-paper-focus instruction are the same ones already in configs/prompts.yaml,
+answer-length guidance are the same ones already in configs/prompts.yaml,
 carried here as the Signature's field descriptions/docstring so the compiled
 program produces output in the same shape. `render_tagged_output` re-wraps
 the module's typed (reasoning, cited_answer) output into the exact
@@ -47,6 +47,9 @@ if sys.version_info < (3, 11):
 
 import dspy
 
+# Shared with the static template so [Doc N] maps to contexts[N-1] either way.
+from src.generation.llm_generator import format_context_blocks  # noqa: F401
+
 # Second, independent litellm 1.99.0 bug hit right after the one above: its
 # litellm.types.utils.Message (built with a forward-referenced
 # `ChatCompletionReasoningSummaryTextBlock` type) is never rebuilt with that
@@ -61,23 +64,31 @@ _litellm_types_utils.Message.model_rebuild(
     _types_namespace={"ChatCompletionReasoningSummaryTextBlock": _CRSTB}
 )
 
-# Same citation-format rules as configs/prompts.yaml's <Instructions> block —
-# kept in sync manually; if the YAML template changes, update this docstring.
+# Same rules as configs/prompts.yaml's <Instructions> block (2026-10-03
+# revision, key_metrics_improvements.md P6) — kept in sync manually; if the YAML
+# template changes, update this docstring.
 _CITATION_RULES = (
-    "You are a precise scientific AI research assistant. Answer the "
-    "question based ONLY on the provided context.\n"
-    "1. Comprehension: read the context carefully. If it does not contain "
-    "the answer, reply exactly with: \"The retrieved documents do not "
-    "contain enough information to answer this.\" Do not guess.\n"
-    "2. Citations: every factual claim MUST end with EXACTLY the tag "
-    "[Doc N] where N is the document number (e.g. [Doc 1], [Doc 2]). Do "
-    "NOT use any other format such as (Doc 1), [Document 1], or [1]."
+    "You are a precise scientific research assistant. Answer the question "
+    "using ONLY the provided excerpts, which all come from the same research "
+    "paper and are listed in paper order.\n"
+    "1. Use every excerpt that bears on the question; combine them when needed.\n"
+    "2. Answer in one or two sentences (about 10 to 30 words), stating the "
+    "specific fact first and copying names, numbers and units exactly.\n"
+    "3. End every sentence with its citation in EXACTLY the format [Doc N] "
+    "(e.g. [Doc 2] or [Doc 2][Doc 5]), citing only the excerpts that directly "
+    "state the fact (usually one, at most two). Do NOT use (Doc 1), "
+    "[Document 1], or [1].\n"
+    "4. Only if no excerpt mentions what the question asks about, reply "
+    "exactly with: \"The retrieved documents do not contain enough "
+    "information to answer this.\""
 )
 
+# The field keeps its historical name so compiled programs and
+# compile_dspy_prompt.py stay compatible; its content is no longer a
+# single-document anchor (removed in the P6 revision).
 DEFAULT_PAPER_FOCUS_HINT = (
-    "First, identify which single document is most directly relevant to "
-    "the question. Anchor your answer primarily to that document. Mention "
-    "other documents only if they add genuinely complementary information."
+    "The evidence may be spread over several excerpts, e.g. a method "
+    "paragraph and a results table. Combine them when needed."
 )
 
 
@@ -85,11 +96,11 @@ class ScientificRAGAnswer(dspy.Signature):
     __doc__ = _CITATION_RULES
 
     context: List[str] = dspy.InputField(
-        desc="Numbered retrieved passages, one per list item, each already "
-             "labelled '[Doc N] Source: ... Content: ...'."
+        desc="Numbered excerpts in paper order, one per list item, each "
+             "labelled '[Doc N] Title: ... Section: ...'."
     )
     paper_focus_hint: str = dspy.InputField(
-        desc="Instruction for which single document to anchor the answer to."
+        desc="Guidance on how to use the excerpts."
     )
     question: str = dspy.InputField(desc="The user's scientific question.")
     cited_answer: str = dspy.OutputField(
@@ -110,25 +121,6 @@ class ScientificRAGModule(dspy.Module):
         return self.generate(
             context=context, paper_focus_hint=paper_focus_hint, question=question
         )
-
-
-def format_context_blocks(retrieved_docs: List[Dict[str, Any]]) -> List[str]:
-    """
-    One string per retrieved doc, matching LocalLLMGenerator._build_prompt's
-    per-doc block format exactly (src/generation/llm_generator.py:195-201) —
-    same [Doc N]/Source/Content shape whether generation goes through the
-    static template or this DSPy module, so [Doc N] citation indices map to
-    `contexts[N-1]` identically either way.
-    """
-    blocks = []
-    for i, doc in enumerate(retrieved_docs, 1):
-        doc_id = doc.get("doc_id", doc.get("id", f"doc_{i}"))
-        score = doc.get("rerank_score", doc.get("score", None))
-        score_str = f"  [relevance: {score:.4f}]" if score is not None else ""
-        blocks.append(
-            f"[Doc {i}]\nSource: {doc_id}{score_str}\nContent: {doc.get('text', '')}"
-        )
-    return blocks
 
 
 def render_tagged_output(reasoning: str, cited_answer: str) -> str:
