@@ -145,8 +145,10 @@ class LocalLLMGenerator:
                     "ignoring, using the static template.", dspy_path,
                 )
             else:
-                import dspy
+                # dspy_module first: it patches typing/litellm for Python 3.10
+                # before dspy/litellm are imported (see that module's header).
                 from src.generation.dspy_module import ScientificRAGModule
+                import dspy
                 dspy.settings.configure(
                     lm=dspy.LM(f"openai/{self.model_name}", api_base=self.vllm_url,
                               api_key="EMPTY")

@@ -43,3 +43,20 @@ def test_table_body_appended_and_split_with_repeated_header():
         assert CHUNKER.n_tokens(c["text"]) <= CHUNKER.max_tokens + 20
     rows = [l for c in table2 for l in c["text"].split("\n")[4:]]
     assert len(rows) == 400                                       # no row lost or duplicated
+
+
+def test_rows_format_linearizes_each_data_row():
+    from src.retrieval.chunking import QasperChunker, linearize_markdown_table
+    body = "| Methods | AIDA-B |  |\n|---|---|---|\n| Huang | 86.6% | |\n| our | 94.3% | x |"
+    assert linearize_markdown_table(body) == [
+        "Row 1: Methods is Huang; AIDA-B is 86.6%.",
+        "Row 2: Methods is our; AIDA-B is 94.3%; column 3 is x."]
+    rows_chunker = QasperChunker(table_format="rows")
+    chunks = rows_chunker.process_paper(PAPER, table_bodies={"Table 2: Main results.": body})
+    t2 = [c for c in chunks if c["section_name"] == "Table 2"][0]["text"]
+    assert t2.endswith("Table 2: Main results.\nRow 1: Methods is Huang; AIDA-B is 86.6%.\n"
+                       "Row 2: Methods is our; AIDA-B is 94.3%; column 3 is x.")
+    big = "| M | A |\n|---|---|\n" + "\n".join(f"| m{i} | {i} |" for i in range(400))
+    pieces = rows_chunker.split_table("Table 9: Big.", big)
+    assert len(pieces) > 1 and all(p.startswith("Table 9: Big.\nRow ") for p in pieces)
+    assert sum(p.count("\nRow ") for p in pieces) == 400

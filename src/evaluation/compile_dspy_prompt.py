@@ -289,13 +289,41 @@ def compile_program(
     metric: Callable[..., float],
     max_bootstrapped_demos: int = 4,
     max_labeled_demos: int = 4,
+    optimizer_name: str = "bootstrap",
+    num_candidate_programs: int = 8,
+    num_threads: int = 4,
+    val_fraction: float = 0.4,
 ) -> ScientificRAGModule:
-    """Compiles ScientificRAGModule with BootstrapFewShot. `lm` is injected
-    (a real dspy.LM for production runs, a DummyLM for the smoke test);
-    `metric` is build_alce_metric(...)'s output by default (Finding #5), or
-    citation_format_metric as a no-judge-call fallback."""
+    """
+    Compiles ScientificRAGModule. `lm` is injected (a real dspy.LM for
+    production runs, a DummyLM for the smoke test); `metric` is
+    build_alce_metric(...)'s output by default (Finding #5), or
+    citation_format_metric as a no-judge-call fallback.
+
+    optimizer_name:
+      "bootstrap"     — dspy.BootstrapFewShot.
+      "random_search" — dspy.BootstrapFewShotWithRandomSearch: bootstraps
+                        `num_candidate_programs` demo sets and keeps the best
+                        on a held-out validation split (the last `val_fraction`
+                        of trainset, never used to build demos). DSPy's
+                        optimizer guide recommends it for 50+ examples
+                        (dspy.ai, "Which optimizer should I use?").
+    """
     dspy.settings.configure(lm=lm)
     module = ScientificRAGModule()
+    if optimizer_name == "random_search":
+        n_val = max(1, int(len(trainset) * val_fraction))
+        train, val = trainset[:-n_val], trainset[-n_val:]
+        logging.info("BootstrapFewShotWithRandomSearch: %d train / %d validation examples, "
+                     "%d candidate programs.", len(train), len(val), num_candidate_programs)
+        optimizer = dspy.BootstrapFewShotWithRandomSearch(
+            metric=metric,
+            max_bootstrapped_demos=max_bootstrapped_demos,
+            max_labeled_demos=max_labeled_demos,
+            num_candidate_programs=num_candidate_programs,
+            num_threads=num_threads,
+        )
+        return optimizer.compile(module, trainset=train, valset=val)
     optimizer = dspy.BootstrapFewShot(
         metric=metric,
         max_bootstrapped_demos=max_bootstrapped_demos,
@@ -448,6 +476,10 @@ def main() -> None:
     parser.add_argument("--model-id", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--api-base", type=str,
                         default=os.environ.get("VLLM_API_URL", "http://localhost:8000/v1"))
+    parser.add_argument("--optimizer", choices=["bootstrap", "random_search"], default=None,
+                        help="Default: random_search for 50+ training examples, else bootstrap "
+                             "(DSPy optimizer guide).")
+    parser.add_argument("--num-candidate-programs", type=int, default=8)
     parser.add_argument("--max-bootstrapped-demos", type=int, default=4)
     parser.add_argument("--max-labeled-demos", type=int, default=4)
     parser.add_argument(
@@ -501,10 +533,13 @@ def main() -> None:
         metric_fn = citation_format_metric
 
     lm = dspy.LM(f"openai/{args.model_id}", api_base=args.api_base, api_key="EMPTY")
+    optimizer_name = args.optimizer or ("random_search" if len(trainset) >= 50 else "bootstrap")
     compiled = compile_program(
         trainset, lm=lm, metric=metric_fn,
         max_bootstrapped_demos=args.max_bootstrapped_demos,
         max_labeled_demos=args.max_labeled_demos,
+        optimizer_name=optimizer_name,
+        num_candidate_programs=args.num_candidate_programs,
     )
     compiled.save(args.output_path)
     logging.info("Compiled program saved to %s", args.output_path)

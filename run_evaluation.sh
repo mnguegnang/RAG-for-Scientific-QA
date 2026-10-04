@@ -139,9 +139,17 @@ done
 # ============================================================
 # HuggingFace token
 # ============================================================
+# An exported HF_TOKEN wins; otherwise read it from the project's .env
+# (git-ignored). Only the HF_TOKEN line is parsed — the file is not sourced —
+# and the value is never printed.
+if [ -z "${HF_TOKEN:-}" ] && [ -f "${PROJECT_ROOT}/.env" ]; then
+    HF_TOKEN=$(sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}HF_TOKEN[[:space:]]*=[[:space:]]*//p' \
+        "${PROJECT_ROOT}/.env" | tail -1 | sed -e "s/^[\"']//" -e "s/[\"'][[:space:]]*$//")
+    [ -n "${HF_TOKEN}" ] && echo "HF token    : loaded from ${PROJECT_ROOT}/.env"
+fi
 if [ -z "${HF_TOKEN:-}" ]; then
     echo "ERROR: HF_TOKEN is not set."
-    echo "       export HF_TOKEN=hf_XXXX before running this script."
+    echo "       Add HF_TOKEN=hf_XXXX to ${PROJECT_ROOT}/.env or export it before running this script."
     exit 1
 fi
 # vLLM and huggingface_hub read the token from the environment. It is not

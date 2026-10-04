@@ -17,7 +17,8 @@ _DEFAULT_TABLE_BODIES = _PROJECT_ROOT / "data" / "table_bodies.json"
 
 
 def run_ingestion_pipeline(indices_dir: Path = _PROJECT_ROOT / "data" / "indices",
-                           table_bodies_path: Path = _DEFAULT_TABLE_BODIES):
+                           table_bodies_path: Path = _DEFAULT_TABLE_BODIES,
+                           table_format: str = "markdown"):
     print("=== Data Ingestion & Indexing ===")
     # 1. Load Data
     raw_data = load_and_inspect_qasper()
@@ -41,7 +42,8 @@ def run_ingestion_pipeline(indices_dir: Path = _PROJECT_ROOT / "data" / "indices
 
     # 2. Chunking
     print("\n--- Chunking ---")
-    chunker = QasperChunker()
+    chunker = QasperChunker(table_format=table_format)
+    print(f"Table format: {table_format}")
     all_chunks = []
 
     for paper in subset_data:
@@ -75,6 +77,10 @@ if __name__ == "__main__":
     parser.add_argument("--indices-dir", default=str(_PROJECT_ROOT / "data" / "indices"))
     parser.add_argument("--table-bodies", default=str(_DEFAULT_TABLE_BODIES),
                         help="JSON from src.data.arxiv_tables ('' to index captions only).")
+    parser.add_argument("--table-format", choices=["markdown", "rows"], default="markdown",
+                        help="Table bodies as Markdown, or one linearized sentence per row "
+                             "(TabFact horizontal template).")
     args = parser.parse_args()
     run_ingestion_pipeline(Path(args.indices_dir),
-                           Path(args.table_bodies) if args.table_bodies else None)
+                           Path(args.table_bodies) if args.table_bodies else None,
+                           table_format=args.table_format)

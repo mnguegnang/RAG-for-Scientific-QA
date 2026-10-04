@@ -5,7 +5,7 @@ Newest work comes first. Each part is dated and states what it does.
 
 | Part | Date | What it does | Status |
 |---|---|---|---|
-| [Part 1](#part-1--2026-10-03-literature-grounded-component-review-second-review) | 2026-10-03 | Second review: diagnoses each pipeline component against QASPER gold evidence, proposes six source-backed improvements (P1–P6), implements them, measures their effect, and explains how to test them | Implemented; full 150-question evaluation pending — see §1.6 *How to test and see the effect* |
+| [Part 1](#part-1--2026-10-03-literature-grounded-component-review-second-review) | 2026-10-03 | Second review: diagnoses each pipeline component against QASPER gold evidence, proposes six source-backed improvements (P1–P6), implements them, measures their effect, and explains how to test them | Implemented. §1.6 Steps 0–7a run on 2026-10-04 (results in §1.7); RRF, text-only and old-selection variants and the Step 8 decision pending (§1.8) |
 | [Part 2](#part-2--2026-09-02-error-analysis-and-evaluation-correctness-review-first-review) | 2026-09-02 | First review: error analysis of the 2026-09-02 evaluation run, measurement bugs, and six ranked fixes (Findings #1–#6) | Findings #4–#6 implemented 2026-09-05 (commit `e76017e`); its metric table predates the paper-scoping fix |
 
 ---

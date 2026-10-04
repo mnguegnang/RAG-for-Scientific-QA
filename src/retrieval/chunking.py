@@ -7,9 +7,46 @@ _FLOAT_LABEL_RE = re.compile(r'^\s*(Table|Figure|Fig\.?)\s*(\d+)', re.IGNORECASE
 # QASPER figure files look like "4-Table1-1.png": the leading number is the page.
 _FLOAT_PAGE_RE = re.compile(r'^(\d+)-')
 
+TABLE_FORMATS = ("markdown", "rows")
+
+
+def _markdown_cells(line: str) -> List[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def linearize_markdown_table(body: str) -> List[str]:
+    """
+    One natural-language sentence per data row, read horizontally:
+    "Row 3: Methods is our; AIDA-B is 94.3%."
+
+    This is TabFact's "horizontal template" linearization (Chen et al.,
+    ICLR 2020, §3.2): with cells joined by copulas and punctuation, a
+    text-pretrained entailment model verified table statements at 65.1%
+    test accuracy, against 50.4% (chance level) for the same table as plain
+    concatenated cells (Table 2). The support checkers here (MiniCheck,
+    Prometheus) and the generator are text-pretrained as well.
+
+    *body* follows the arxiv_tables.table_to_markdown contract (header row,
+    separator row, data rows). Empty cells are skipped; an empty header
+    becomes "column N".
+    """
+    lines = [l for l in body.split("\n") if l.strip()]
+    if len(lines) < 3:
+        return []
+    header = _markdown_cells(lines[0])
+    sentences = []
+    for i, line in enumerate(lines[2:], 1):
+        cells = _markdown_cells(line)
+        parts = [f"{header[j] if j < len(header) and header[j] else f'column {j + 1}'} is {cell}"
+                 for j, cell in enumerate(cells) if cell]
+        if parts:
+            sentences.append(f"Row {i}: " + "; ".join(parts) + ".")
+    return sentences
+
 
 class QasperChunker:
-    def __init__(self, model_name="allenai/specter2_base", max_tokens=500, overlap_pct=0.1):
+    def __init__(self, model_name="allenai/specter2_base", max_tokens=500, overlap_pct=0.1,
+                 table_format: str = "markdown"):
         """
         Initializes the chunker.
 
@@ -25,6 +62,11 @@ class QasperChunker:
         self.tokenizer.model_max_length = int(1e30)
 
         self.max_tokens = max_tokens
+        # How table bodies are written into chunks: "markdown" (header, separator
+        # and data rows) or "rows" (one linearized sentence per data row).
+        if table_format not in TABLE_FORMATS:
+            raise ValueError(f"table_format must be one of {TABLE_FORMATS}")
+        self.table_format = table_format
         # Calculate overlap tokens (e.g., 500 * 0.1 = 50 tokens)
         self.overlap_tokens = int(max_tokens * overlap_pct)
 
@@ -58,32 +100,37 @@ class QasperChunker:
 
     def split_table(self, caption: str, body: str) -> List[str]:
         """
-        Caption + Markdown table body, split row-wise so every chunk repeats the
-        caption and the header row and stays within max_tokens. A table split
-        mid-row would leave numbers without the column names that give them
-        meaning, so the sliding window used for prose is not used here.
+        Caption + table body, split row-wise so every chunk repeats the
+        caption (and, for Markdown, the header row) and stays within
+        max_tokens. A table split mid-row would leave numbers without the
+        column names that give them meaning, so the sliding window used for
+        prose is not used here.
 
         *body* follows the arxiv_tables.table_to_markdown contract: header
-        row, separator row, then data rows.
+        row, separator row, then data rows. With table_format="rows" each
+        data row is first linearized into a sentence that names its columns.
         """
-        text = f"{caption}\n{body}" if body else caption
-        if not body or self.n_tokens(text) <= self.max_tokens:
+        if body and self.table_format == "rows":
+            rows = linearize_markdown_table(body)
+            prefix = caption
+        else:
+            rows = body.split("\n")[2:] if body else []
+            prefix = f"{caption}\n" + "\n".join(body.split("\n")[:2]) if body else caption
+        text = f"{prefix}\n" + "\n".join(rows) if rows else caption
+        if not rows or self.n_tokens(text) <= self.max_tokens:
             return [text]
 
-        rows = body.split("\n")
-        header, data_rows = "\n".join(rows[:2]), rows[2:]
-        budget = self.max_tokens - self.n_tokens(f"{caption}\n{header}") - 8
-
+        budget = self.max_tokens - self.n_tokens(prefix) - 8
         chunks, current, used = [], [], 0
-        for row in data_rows:
+        for row in rows:
             cost = self.n_tokens(row) + 1
             if current and used + cost > budget:
-                chunks.append(f"{caption}\n{header}\n" + "\n".join(current))
+                chunks.append(f"{prefix}\n" + "\n".join(current))
                 current, used = [], 0
             current.append(row)
             used += cost
         if current:
-            chunks.append(f"{caption}\n{header}\n" + "\n".join(current))
+            chunks.append(f"{prefix}\n" + "\n".join(current))
         # A single oversized row still has to fit the encoder.
         return [piece for chunk in chunks for piece in self.split_large_text(chunk)]
 
