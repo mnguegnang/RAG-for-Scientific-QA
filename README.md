@@ -129,7 +129,7 @@ export HF_TOKEN="hf_XXXX"
 falls back to `.venv` when `.venv-vllm` is absent.
 
 On RunPod, or wherever `HF_HUB_ENABLE_HF_TRANSFER=1` is set, see
-[docs/operations.md](docs/operations.md).
+[Project_Note.md](Project_Note.md#deployment-notes-runpod-and-huggingface-downloads).
 
 ---
 
@@ -266,7 +266,7 @@ The generation system prompt, few-shot exemplar, and output-format instructions.
 - **Retrieval harness:** evidence recall against QASPER's gold evidence, with no LLM.
 
 Definitions, scoring details, CRAG calibration and supporting scripts are in
-[docs/evaluation.md](docs/evaluation.md).
+[Project_Note.md](Project_Note.md).
 
 ### Running evaluation
 

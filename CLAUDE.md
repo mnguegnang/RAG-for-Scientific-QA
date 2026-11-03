@@ -120,3 +120,7 @@ Kept chunks are trimmed to `--max-context-tokens` (lowest-ranked dropped first) 
 **Index format:** `dense.index.meta` and `sparse.pkl` are pickled Python objects. `sparse.pkl` is `{'model': BM25Okapi, 'metadata': [{'text': str, 'paper_id': str, 'chunk_id': str, 'chunk_type': str, 'position': int, ...}]}`. Both share the same chunk ordering — never swap one without rebuilding the other. Indices built before 2026-10 lack `chunk_type`/`position`; paper order then falls back to parsing `chunk_id`. `data/indices_text_only/` keeps the pre-2026-10 text-only index for before/after comparisons.
 
 **FAISS:** not installable via pip for GPU support; must use the conda channel. The `requirements.txt` pip entry is kept only as a reference.
+
+## Documentation
+
+When the README needs to point readers to more detail (deployment notes, evaluation reference, recovery steps), point to `Project_Note.md` and add the detail there. Don't create new documentation files such as `docs/*.md`, and don't duplicate content already in `Project_Note.md`.
