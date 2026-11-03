@@ -1,8 +1,12 @@
 # RAG System for Answering Scientific Questions in NLP
 
-A **Retrieval-Augmented Generation (RAG)** pipeline for open-domain question answering over scientific papers. Given a natural-language question, the system retrieves relevant passages from a local FAISS + BM25 index, reranks them with ColBERT v2 late interaction, applies a Corrective RAG relevance gate, and prompts a local LLM to produce a cited, well-supported answer.
+A **Retrieval-Augmented Generation (RAG)** pipeline for open-domain question answering over scientific papers. Given a natural-language question, the system retrieves relevant passages from a local FAISS + BM25 index, reranks them with ColBERT v2 late interaction, labels their relevance with Corrective RAG, and prompts a local LLM to produce a cited answer.
+
 
 The pipeline is built on the [QASPER](https://huggingface.co/datasets/allenai/qasper) benchmark (Dasigi et al. 2021, NAACL) but is dataset-agnostic and can be reindexed against any document collection.
+
+**Status:** research project under active development. The current pipeline defaults have not
+yet been evaluated end to end; see [Evaluation](#evaluation).
 
 ---
 
@@ -16,6 +20,8 @@ The pipeline is built on the [QASPER](https://huggingface.co/datasets/allenai/qa
 - [Configuration](#configuration)
 - [Evaluation](#evaluation)
 - [Project Structure](#project-structure)
+- [Contributing](#contributing)
+- [Support](#support)
 - [License](#license)
 
 ---
@@ -65,19 +71,21 @@ User Query (+ paper_id)
  Cited Answer
 ```
 
+In paper-scoped mode, stage 1 returns every chunk of the paper for most papers (94% of
+sampled papers had ≤ 100 chunks on the text-only index), so ColBERT ranking decides what the
+model reads. CRAG in `signal` mode labels documents without changing the context.
+
 | Component | Model / Library |
 |-----------|----------------|
-| **Document ingestion** | HuggingFace `datasets` — `allenai/qasper` |
+| **Document ingestion** | HuggingFace `datasets` — `allenai/qasper` (pinned to datasets==2.21.0: 3.x rejects QASPER’s loading script) |
 | **Chunking** | Custom `QasperChunker` — abstract, 500-token paragraph chunks (10% overlap), table/figure captions, Markdown table bodies; contextual prefix |
 | **Dense embedding** | `allenai/specter2_base` + retrieval adapter (768-dim) |
-| **Vector store** | FAISS flat index (`IndexFlatIP`) |
 | **Sparse index** | BM25 (`rank-bm25`) with NLTK tokenization, stop-word removal, Porter stemming |
 | **Retrieval fusion** | Reciprocal Rank Fusion (Cormack et al. 2009, `rrf_k=60`) |
 | **Reranker** | ColBERT v2 late interaction (`colbert-ir/colbertv2.0`, Santhanam et al. 2022) via RAGatouille; optional RRF with the stage-1 ranks |
-| **Relevance gate** | Corrective RAG (Yan et al. 2024) — three-way classification; non-destructive by default |
+| **Relevance labelling** | Corrective RAG (Yan et al. 2024) — three-way classification; changes the context only in `refine` and `legacy` modes |
 | **Context order** | Order-preserving RAG (Yu et al. 2024, arXiv:2409.01666) |
 | **LLM** | `meta-llama/Llama-3.1-8B-Instruct` via vLLM, HuggingFace Transformers, or Ollama |
-| **Orchestration** | Custom Python (`src/run_rag.py::ScientificRAGPipeline`) |
 
 ---
 
@@ -93,11 +101,9 @@ User Query (+ paper_id)
 
 ## Installation
 
-**Two virtualenvs are required and cannot be merged.** vLLM 0.28 needs `transformers>=5.5` /
-`huggingface_hub>=1.27`; the SPECTER2 encoder depends on `adapters`, which pins
-`transformers~=4.51` and the pre-1.0 `huggingface_hub` API. No `adapters` release supports
-transformers 5.x, so the two can't share an environment. They never need to: the pipeline talks
-to vLLM only over HTTP and never imports it.
+**Two virtualenvs are required and cannot be merged.** vLLM 0.28 needs `transformers>=5.5`, while
+the SPECTER2 encoder's `adapters` dependency pins `transformers~=4.51`. The pipeline reaches vLLM
+only over HTTP, so the two never share an environment.
 
 ```bash
 # 1. Project env — RAG pipeline, evaluation, ingestion
@@ -122,15 +128,8 @@ export HF_TOKEN="hf_XXXX"
 `run_evaluation.sh` selects the interpreter per phase (`RAG_PY` / `VLLM_PY`) automatically and
 falls back to `.venv` when `.venv-vllm` is absent.
 
-> **RunPod note:** `/` is a small container overlay and `/workspace` is the persistent volume.
-> `run_evaluation.sh` pins `HF_HOME`, `VLLM_CACHE_ROOT`, `TORCHINDUCTOR_CACHE_DIR`,
-> `TRITON_CACHE_DIR`, and `NLTK_DATA` under `/workspace` so caches survive a pod restart, and
-> sources `/workspace/.bashrc_custom` (skipped by non-interactive shells otherwise).
-
-> **`hf_transfer` is required** wherever `HF_HUB_ENABLE_HF_TRANSFER=1` is set (the RunPod image
-> sets it by default) — without the package, downloads fail with a misleading
-> `Unrecognized model ... no model_type key` error. It's pinned in `requirements.txt`; install it
-> into `.venv-vllm` too if that env downloads models directly.
+On RunPod, or wherever `HF_HUB_ENABLE_HF_TRANSFER=1` is set, see
+[docs/operations.md](docs/operations.md).
 
 ---
 
@@ -142,8 +141,8 @@ The system indexes the training split of QASPER (`allenai/qasper`), which contai
 NLP research papers. Each paper yields, in reading order: its abstract, its paragraphs (split into
 overlapping 500-token chunks when longer), and one chunk per table/figure caption. When
 `data/table_bodies.json` exists, table chunks also carry the table body as Markdown, extracted from
-the paper's arXiv LaTeX source (40% of the evaluation questions need table/figure evidence). Every
-chunk is prefixed with:
+the paper's arXiv LaTeX source (60 of the 150 evaluation questions have table or figure gold
+evidence; 26 rely on it alone. Figures get captions only.) Every chunk is prefixed with:
 
 ```
 Title: <paper title>. Section: <section heading>.
@@ -212,9 +211,6 @@ Optional flags:
 | `--crag-correct` | `14.44` | ColBERT MaxSim threshold for the CRAG `Correct` label |
 | `--crag-ambiguous` | `8.0` | ColBERT MaxSim threshold for the CRAG `Ambiguous` label |
 | `--crag-consistency` | `0.0` (`0.3` in legacy mode) | Minimum fraction of docs labeled `Correct` for action `Correct` |
-| `--dense-index` | `data/indices/dense.index` | Path to the FAISS index |
-| `--dense-meta` | `data/indices/dense.index.meta` | Path to the chunk metadata pickle |
-| `--sparse-index` | `data/indices/sparse.pkl` | Path to the BM25 index |
 
 **Example output:**
 
@@ -222,51 +218,6 @@ Optional flags:
 ANSWER:
 The model uses a bidirectional LSTM encoder with 256 hidden units [Doc 2].
 Attention is computed over the encoder states using a learned query vector [Doc 2].
-
-[CRAG] Action: Correct
-[CRAG] Correct: 8, Ambiguous: 1, Incorrect: 1 | Consistency: 0.80
-```
-
-### Run CRAG threshold calibration
-
-Finds the F1-maximizing ColBERT score boundary from a completed evaluation report and writes a
-diagnostic plot.
-
-```bash
-python -m src.evaluation.calibrate_crag                                     # uses data/evaluation_report.csv
-python -m src.evaluation.calibrate_crag --eval-csv data/evaluation_report.csv
-```
-
-Output: recommended threshold on stdout + `reports/figures/crag_calibration.png`.
-
-### Run the full evaluation pipeline
-
-```bash
-export HF_TOKEN="hf_XXXX"
-bash run_evaluation.sh      # interactive / RunPod
-sbatch run_evaluation.sh    # SLURM
-```
-
-The script auto-detects available GPUs (multi-GPU tensor-parallel, single-GPU with a computed
-`--gpu-memory-utilization`, or CPU-only via Ollama) and runs two phases sequentially so a single
-24 GB GPU (e.g. RTX 4090) is enough:
-
-1. Start Llama 3.1-8B on a vLLM server.
-2. `generate_predictions.py` runs RAG over QASPER → `data/evaluation_dataset.csv`.
-3. Stop the Llama server; start `prometheus-eval/prometheus-7b-v2.0` on a vLLM server.
-4. `evaluate_rag.py` scores with Prometheus 2 + ALCE → `data/evaluation_report.csv`.
-5. Stop the Prometheus server.
-
-Logs: `logs/eval_<jobid>.log` / `logs/eval_error_<jobid>.log` under SLURM.
-
-### Fixing failed prediction rows
-
-Re-generates only the rows in `evaluation_dataset.csv` whose answer is a `System Error:`/`Error:`
-string (e.g. after a transient Ollama/vLLM outage), scoped to the same `paper_id` as the original
-row so retries can't pull in another paper's passages:
-
-```bash
-python -m src.evaluation.generate_predictions --fix-errors
 ```
 
 ---
@@ -287,23 +238,16 @@ python -m src.evaluation.generate_predictions --fix-errors
 
 ### Key hyperparameters
 
+Parameters with a CLI flag are listed under [Usage](#usage).
+
 | Parameter | File | Default | Description |
 |-----------|------|---------|-------------|
 | `max_tokens` | `retrieval/chunking.py` | `500` | Chunk size in tokens (SPECTER2 max: 512) |
 | `overlap_pct` | `retrieval/chunking.py` | `0.1` | Overlap fraction (50 tokens) |
 | retrieval `k` | `run_rag.py` | `100` | Candidates fetched by hybrid retrieval before reranking |
 | `rrf_k` | `retrieval/hybrid_retriever.py` | `60` | RRF constant (Cormack et al. 2009) |
-| `context_k` | `run_rag.py` | `20` | Documents kept after ranking (`--context-k`) |
-| `max_context_tokens` | `run_rag.py` | `6000` | Context budget (`--max-context-tokens`) |
 | `HYDE_QUERY_WORD_THRESHOLD` | `run_rag.py` | `10` | Queries shorter than this (in words) trigger HyDE |
-| `crag_correct_threshold` | `run_rag.py` | `14.44` | ColBERT MaxSim floor for CRAG `Correct` |
-| `crag_ambiguous_threshold` | `run_rag.py` | `8.0` | ColBERT MaxSim floor for CRAG `Ambiguous` |
-| `crag_consistency_ratio` | `run_rag.py` | `0.0` (`0.3` legacy) | Min. fraction of `Correct`-labeled docs required |
 | `gpu_memory_utilization` | `run_evaluation.sh` | auto-computed | vLLM GPU memory fraction (single-GPU mode) |
-
-### `configs/default.yaml`
-
-Retrieval and generation hyperparameters, overridable without editing source code.
 
 ### `configs/prompts.yaml`
 
@@ -313,48 +257,39 @@ The generation system prompt, few-shot exemplar, and output-format instructions.
 
 ## Evaluation
 
-### Framework
+### Metrics
 
-- **Prometheus 2** (Kim et al. 2024, [arXiv:2405.01535](https://arxiv.org/abs/2405.01535)) — an
-  LLM judge fine-tuned specifically for evaluation, scored with the ABSOLUTE_PROMPT rubric format
-  (raw 1–5 score normalized to `[0, 1]`). Auto-selects a backend: vLLM server → HF `transformers`
-  pipeline → Ollama (CPU fallback).
-  - *Context Precision* — relevance of the 3 best-ranked retrieved chunks
-  - *Answer Relevancy* — how completely the answer addresses the question
-  - *Answer Correctness* — factual match against the QASPER reference answer
+- **[Prometheus 2](https://arxiv.org/abs/2405.01535) rubric judge:** context precision, answer
+  relevancy and answer correctness.
+- **Sentence-level support checks:** context recall and faithfulness.
+- **[ALCE](https://github.com/princeton-nlp/ALCE) citation checks:** citation precision and recall.
+- **Retrieval harness:** evidence recall against QASPER's gold evidence, with no LLM.
 
-- **Sentence-level support checks** (`src/evaluation/grounding.py`, `--grounding-checker`):
-  - *Context Recall* — fraction of ground-truth sentences supported by the retrieved chunks
-  - *Faithfulness* — fraction of answer sentences supported by the retrieved chunks
-  - The default `hybrid` checker uses Prometheus True/False prompts for context recall and
-    **MiniCheck-Flan-T5-Large** ([Tang et al. 2024](https://arxiv.org/abs/2404.10774)) for
-    faithfulness and ALCE — the per-metric split that agreed best with independent labels
-    (`compare_grounding_checkers.py`). Both metrics see every chunk the generator saw.
-
-- **[ALCE](https://github.com/princeton-nlp/ALCE)** (Gao et al. 2023, EMNLP) — citation-level
-  grounding via NLI entailment (decided by the support checker above):
-  - *Citation Precision* — fraction of citations that are correct (sufficient or necessary)
-  - *Citation Recall* — fraction of answer sentences entailed by their cited documents
-
-- **Retrieval harness** (`python -m src.evaluation.evaluate_retrieval`) — evidence recall against
-  QASPER's gold evidence (text paragraphs and tables/figures) for a grid of context-selection
-  configurations, with no LLM or judge calls. Use it to choose `--context-k`, `--final-ranking`
-  and `--crag-mode` before a full evaluation run.
+Definitions, scoring details, CRAG calibration and supporting scripts are in
+[docs/evaluation.md](docs/evaluation.md).
 
 ### Running evaluation
 
 ```bash
+export HF_TOKEN="hf_XXXX"
 python -m src.evaluation.evaluate_retrieval     # no LLM: evidence recall per config → data/retrieval_eval.csv
 python -m src.evaluation.generate_predictions   # requires indices → data/evaluation_dataset.csv
 python -m src.evaluation.evaluate_rag           # requires vLLM/Ollama running → data/evaluation_report.csv
 bash run_evaluation.sh                          # both, end-to-end
+sbatch run_evaluation.sh                        # both, on SLURM
 PIPELINE_ARGS="--context-k 30 --crag-mode refine" bash run_evaluation.sh   # an alternative config
 ```
 
-### Current results
+`run_evaluation.sh` runs generation and scoring one after the other, so a single 24 GB GPU is enough.
 
-150 QASPER questions, 128 scored (the rest suppressed by the CRAG gate or dropped as judge
-errors); reproduce with the commands above:
+### Baseline results (2026-09-02, before the P1–P6 changes)
+
+These numbers come from the 2026-09-02 pipeline: text-only index, top 10 contexts, CRAG in
+legacy mode, previous prompt. The current defaults are not yet evaluated end to end
+(see `key_metrics_improvements.md`). 150 QASPER questions from the train split, free-form
+answers only. 128 were scored; 22 refusals and errors are excluded from every mean.
+Counting them as wrong gives an answer correctness of about 0.40. Context recall also
+excludes reference answers shorter than 10 characters.
 
 | Metric | Mean |
 |--------|------|
@@ -367,63 +302,45 @@ errors); reproduce with the commands above:
 | ALCE Citation Recall | 0.6740 |
 | ALCE Citation F1 | 0.6556 |
 
-### Judge validation utilities
+**Retrieval only, current code** (150 questions, gold evidence, no LLM judge):
 
-`src/evaluation/` also has standalone scripts used to validate the evaluation pipeline itself
-rather than the RAG system:
+| Configuration | Evidence recall | Table/figure caption hit |
+|---|---|---|
+| Old pipeline, text-only index | 0.485 | 0.000 |
+| Current defaults, text-only index | 0.646 | 0.000 |
+| Current defaults, current index | 0.829 | 0.700 |
 
-| Script | Purpose |
-|--------|---------|
-| `validate_judge.py` / `compute_agreement.py` | Human-vs-Prometheus agreement (Cohen's kappa) at the atomic-decision level |
-| `second_judge_label.py` | Auto-labels the blind validation set with Claude as an independent second judge |
-| `validate_retrieval_scoping.py` | Regression check that retrieved contexts stay within the queried paper |
-| `validate_precision_cutoff.py` | Checks whether scoring context precision on top-3 vs. top-10 chunks diverges |
-| `compile_dspy_prompt.py` | Compiles the generation prompt's few-shot demonstrations with DSPy |
-| `compare_grounding_checkers.py` | Kappa of MiniCheck vs. Prometheus 2 against the labelled validation units |
-| `evaluate_retrieval.py` | Offline evidence recall vs. QASPER gold evidence (no LLM) |
-| `compare_reports.py` | Paired per-metric comparison of two evaluation reports, with bootstrap CIs |
+A table/figure hit counts the caption reaching the context, not the row holding the answer.
+These settings were chosen on the same 150 questions.
 
 ---
 
 ## Project Structure
 
-```
-RAG-for-Scientific-QA/
-├── configs/
-│   ├── default.yaml                # Retrieval and generation hyperparameters
-│   └── prompts.yaml                # System prompt and output-format templates
-├── data/
-│   ├── evaluation_dataset.csv      # RAG predictions (input to evaluate_rag.py)
-│   ├── evaluation_report.csv       # Prometheus 2 + ALCE scores per question
-│   └── indices/
-│       ├── dense.index             # FAISS flat index
-│       ├── dense.index.meta        # Chunk metadata (text, paper_id, section)
-│       └── sparse.pkl              # BM25 model + tokenized corpus
-├── reports/
-│   └── figures/
-│       └── crag_calibration.png    # CRAG threshold calibration plot
-├── src/
-│   ├── pipeline_ingest.py          # Builds dense + sparse indices
-│   ├── run_rag.py                  # ScientificRAGPipeline orchestrator
-│   ├── data/
-│   │   └── make_dataset.py         # Loads the QASPER dataset for ingestion
-│   ├── retrieval/
-│   │   ├── chunking.py             # 500-token overlapping chunks + metadata prefix
-│   │   ├── encoders.py             # SPECTER2 encoder
-│   │   ├── vector_store.py         # FAISS index builder
-│   │   ├── sparse_store.py         # BM25 index builder (NLTK tokenization)
-│   │   ├── hybrid_retriever.py     # RRF fusion + paper_id filter + pickle verification
-│   │   └── reranker.py             # ColBERT v2 late-interaction reranker
-│   ├── generation/
-│   │   ├── llm_generator.py        # vLLM / HuggingFace / Ollama backends
-│   │   └── dspy_module.py          # DSPy-compiled generation prompt
-│   └── evaluation/
-│       ├── generate_predictions.py # Run RAG over QASPER → evaluation_dataset.csv
-│       ├── evaluate_rag.py         # Prometheus 2 + ALCE scorer → evaluation_report.csv
-│       └── calibrate_crag.py       # CRAG threshold calibration
-├── run_evaluation.sh               # End-to-end evaluation (SLURM or interactive)
-└── src/run_pipeline_ingest.sh      # SLURM batch job for index building
-```
+- `src/pipeline_ingest.py` builds the dense and sparse indices.
+- `src/run_rag.py` holds `ScientificRAGPipeline` and the query CLI.
+- `src/evaluation/` holds prediction generation, scoring and calibration.
+- `configs/prompts.yaml` holds the generation prompt.
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome. Before opening a pull request:
+
+1. Set up the environment as described in [Installation](#installation).
+2. Run the unit tests with `.venv/bin/python -m pytest tests` (`HF_HOME` must point at the model cache).
+3. If you change retrieval or context selection, include the before and after results of
+   `python -m src.evaluation.evaluate_retrieval`.
+4. If you change chunking or indexing, rebuild both indices together.
+
+---
+
+## Support
+
+Report bugs and ask questions through
+[GitHub Issues](https://github.com/mnguegnang/RAG-for-Scientific-QA/issues).
+Maintained by Gabin Maxime Nguegnang.
 
 ---
 
